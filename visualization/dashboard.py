@@ -10,7 +10,14 @@ Echo Grid — Live Field Visualization
 from __future__ import annotations
 
 import argparse
+import sys
 import time
+from pathlib import Path
+
+# Ensure project root is on the path when run as a script
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 import numpy as np
 import matplotlib.pyplot as plt
