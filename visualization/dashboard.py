@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""
-Echo Grid live — CSI default; optional optical/ultrasonic body merge
-
-  python visualization/dashboard.py
-  python visualization/dashboard.py --body          # Field Body (optical-body-s3 or ultrasonic)
-  python visualization/dashboard.py --body --drive  # observe + excite
-"""
+"""Echo Grid live — driverless |Δf| equilibrium from CSI drive map."""
 
 from __future__ import annotations
 
@@ -42,17 +36,15 @@ TRACK_COLORS = ["#ff4d6d", "#4cc9f0", "#f4a261", "#a0e8af", "#c77dff", "#ffe066"
 
 
 class LiveDashboard:
-    def __init__(self, size=16, body_port=None, csi_port=4210, drive=False, closed_loop=True, auto_body=False):
-        self.osys = EchoGridOS(
-            size=size, body_port=body_port, csi_port=csi_port, auto_body=auto_body,
-        )
+    def __init__(self, size=16, body_port=None, csi_port=4210, drive=False, closed_loop=True):
+        self.osys = EchoGridOS(size=size, body_port=body_port, csi_port=csi_port)
         self.drive = drive
         self.closed_loop = closed_loop
         self.size = size
         self._frame = 0
         self._last_log = 0.0
         self._running = True
-        self._df_clim = 300.0
+        self._df_clim = 350.0
 
         self.fig = plt.figure(figsize=(12, 9))
         gs = self.fig.add_gridspec(2, 2, hspace=0.32, wspace=0.28)
@@ -94,8 +86,9 @@ class LiveDashboard:
         self.im_df = self.ax_df.imshow(
             z.copy(), cmap="inferno", vmin=0, vmax=400, origin="lower", extent=[0, 1, 0, 1],
         )
-        self.ax_df.set_title("3 · Actuator |Δf|", fontsize=11)
+        self.ax_df.set_title("3 · Actuator drive |Δf| (CSI-held)", fontsize=11)
         self.cbar_df = self.fig.colorbar(self.im_df, ax=self.ax_df, fraction=0.046, pad=0.04)
+        self.cbar_df.set_label("|Hz| planned")
         self.df_readout = self.ax_df.text(
             0.02, 0.98, "|Δf| max —", transform=self.ax_df.transAxes,
             ha="left", va="top", fontsize=9, family="monospace", color="white",
@@ -176,23 +169,24 @@ class LiveDashboard:
         bt = self.osys.body_type or ("body" if self.osys.body_connected else "-")
         self.csi_readout.set_text(
             f"motion {e:.2f}   pkts {self.osys.csi_packets}\n"
-            f"tracks {len(tracks)}   body {bt}  obs {self.osys.last_obs:.2f}"
+            f"tracks {len(tracks)}   body {bt}"
         )
 
-        df_abs = np.array(self.osys.mapper.delta_f_abs(phi_view), dtype=np.float32, copy=True)
+        # CSI-held drive map (works driverless)
+        df_abs = np.array(self.osys.actuator_map(phi_view), dtype=np.float32, copy=True)
         self.im_df.set_data(df_abs)
         df_max = float(df_abs.max())
         df_mean = float(df_abs.mean())
-        p90 = float(np.percentile(df_abs, 90))
-        target = max(120.0, min(1800.0, p90 * 1.8 + 80.0, df_max * 1.1 + 50.0))
+        p90 = float(np.percentile(df_abs, 90)) if df_max > 0 else 0.0
+        target = max(150.0, min(2000.0, max(p90 * 1.7, df_max * 1.15) + 60.0))
         if target > self._df_clim:
-            self._df_clim = 0.55 * self._df_clim + 0.45 * target
+            self._df_clim = 0.5 * self._df_clim + 0.5 * target
         else:
-            self._df_clim = 0.90 * self._df_clim + 0.10 * target
-        self.im_df.set_clim(0.0, max(120.0, self._df_clim))
+            self._df_clim = 0.93 * self._df_clim + 0.07 * target
+        self.im_df.set_clim(0.0, max(150.0, self._df_clim))
         self.df_readout.set_text(
             f"|Δf| max {df_max:.0f} Hz   mean {df_mean:.0f}\n"
-            f"drive {self.osys.field._drive:.2f}  obs {self.osys.last_obs:.2f}"
+            f"CSI-held drive   motion {e:.2f}"
         )
 
         hist = self.osys.csi.motion_history if self.osys.csi else []
@@ -205,15 +199,15 @@ class LiveDashboard:
 
         self.status.set_text(
             f"frame={self._frame}  motion={e:.3f}  tracks={len(tracks)}  "
-            f"body={bt}  obs={self.osys.last_obs:.2f}  |Δf|_max={df_max:.0f}Hz"
+            f"|Δf|_max={df_max:.0f}Hz  drive={self.osys.field._drive:.2f}  pkts={self.osys.csi_packets}"
         )
 
         now = time.time()
         if now - self._last_log > 1.0:
             self._last_log = now
             print(
-                f"[live] |Δf|_max={df_max:.1f}  drive={self.osys.field._drive:.2f}  "
-                f"motion={e:.3f}  body={bt}  obs={self.osys.last_obs:.2f}"
+                f"[live] |Δf|_max={df_max:.1f}  mean={df_mean:.1f}  "
+                f"motion={e:.3f}  drive={self.osys.field._drive:.2f}  pkts={self.osys.csi_packets}"
             )
 
     def run(self):
@@ -243,20 +237,15 @@ class LiveDashboard:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--body", nargs="?", const="", default=None,
-                   help="Field Body serial (optical-body-s3 or ultrasonic). Empty = auto-detect.")
+    p.add_argument("--body", nargs="?", const="", default=None)
     p.add_argument("--csi", nargs="?", const=4210, type=int, default=4210)
     p.add_argument("--no-csi", action="store_true")
-    p.add_argument("--drive", action="store_true", help="EXCITE body emitters from field peaks")
+    p.add_argument("--drive", action="store_true")
     p.add_argument("--no-loop", action="store_true")
     p.add_argument("--size", type=int, default=16)
     a = p.parse_args()
-
     csi_port = None if a.no_csi else a.csi
-    LiveDashboard(
-        a.size, a.body, csi_port, a.drive, not a.no_loop,
-        auto_body=False,
-    ).run()
+    LiveDashboard(a.size, a.body, csi_port, a.drive, not a.no_loop).run()
 
 
 if __name__ == "__main__":

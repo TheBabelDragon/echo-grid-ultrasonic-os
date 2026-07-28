@@ -1,4 +1,4 @@
-"""Echo Grid — CSI + optical/ultrasonic Field Body closed loop."""
+"""Echo Grid — driverless visual equilibrium via CSI-held drive map."""
 
 from __future__ import annotations
 
@@ -15,8 +15,8 @@ class EchoFieldOS:
         self.size = size
         self.phi = np.zeros((size, size), dtype=np.float32)
         self.vel = np.zeros((size, size), dtype=np.float32)
-        self.lmbda = 0.11
-        self.gamma = 0.93
+        self.lmbda = 0.12
+        self.gamma = 0.94
         self.max_abs = 2.5
         self.entropy = 0.0
         self._drive = 0.0
@@ -24,13 +24,13 @@ class EchoFieldOS:
     def inject(self, x: float, y: float, force: float = 1.0):
         ix = int(np.clip(x * self.size, 0, self.size - 1))
         iy = int(np.clip(y * self.size, 0, self.size - 1))
-        force = float(np.clip(force, -1.6, 1.6))
-        self._drive = min(1.0, 0.8 * self._drive + 0.4 * abs(force))
+        force = float(np.clip(force, -1.8, 1.8))
+        self._drive = min(1.0, 0.75 * self._drive + 0.45 * abs(force))
         for j in range(self.size):
             for i in range(self.size):
                 dx, dy = i - ix, j - iy
                 d2 = dx * dx + dy * dy + 1e-6
-                self.vel[j, i] += np.exp(-d2 * 0.14) * force
+                self.vel[j, i] += np.exp(-d2 * 0.12) * force
 
     def step(self) -> np.ndarray:
         lap = (
@@ -40,9 +40,12 @@ class EchoFieldOS:
         self.vel += (lap - self.phi) * self.lmbda
         self.vel *= self.gamma
         self.phi += self.vel
-        self._drive *= 0.97
-        if self._drive < 0.05:
-            self.phi *= 0.995
+
+        self._drive *= 0.985
+        # only settle when truly undriven
+        if self._drive < 0.03:
+            self.phi *= 0.992
+
         np.clip(self.phi, -self.max_abs, self.max_abs, out=self.phi)
         np.clip(self.vel, -self.max_abs, self.max_abs, out=self.vel)
         self.entropy = float(np.std(self.phi))
@@ -50,7 +53,7 @@ class EchoFieldOS:
 
 
 class UltrasonicMapper:
-    def __init__(self, base_freq: int = 40000, k: float = 1800.0):
+    def __init__(self, base_freq: int = 40000, k: float = 2000.0):
         self.base_freq = base_freq
         self.k = k
 
@@ -61,6 +64,28 @@ class UltrasonicMapper:
     def delta_f_abs(self, field: np.ndarray) -> np.ndarray:
         return np.abs(self.delta_f(field))
 
+    def drive_map(
+        self,
+        field: np.ndarray,
+        csi_spatial: Optional[np.ndarray] = None,
+        motion: float = 0.0,
+        hold_hz: float = 400.0,
+    ) -> np.ndarray:
+        """Driverless visual equilibrium: |Δf| from φ blended with CSI spatial.
+
+        While sensing is alive, the actuator panel shows a held drive plan
+        even if φ has not fully built up yet.
+        """
+        base = self.delta_f_abs(field).astype(np.float32)
+        if csi_spatial is not None and csi_spatial.shape == field.shape:
+            # CSI energy as planned actuator magnitude (Hz)
+            planned = (csi_spatial.astype(np.float32) * hold_hz * max(0.15, motion))
+            # take envelope of field-mapped and sensing-planned
+            out = np.maximum(base, planned)
+        else:
+            out = base
+        return out
+
     def region_energies(self, field: np.ndarray, n_emitters: int = 4) -> List[float]:
         h, w = field.shape
         regions = [
@@ -70,7 +95,6 @@ class UltrasonicMapper:
         return [float(np.mean(np.abs(r))) for r in regions[:n_emitters]]
 
 
-# Map named optical regions → unit-square inject points
 _REGION_XY = {
     "center": (0.5, 0.5),
     "n": (0.5, 0.75), "s": (0.5, 0.25), "e": (0.75, 0.5), "w": (0.25, 0.5),
@@ -83,7 +107,6 @@ def _region_xy(name: str, index: int) -> tuple:
     key = str(name).lower().strip()
     if key in _REGION_XY:
         return _REGION_XY[key]
-    # fall back to quadrant from index
     corners = [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)]
     return corners[index % 4]
 
@@ -106,6 +129,7 @@ class EchoGridOS:
         self.last_csi_energy = 0.0
         self.csi_packets = 0
         self.last_df_max = 0.0
+        self.last_drive_map: Optional[np.ndarray] = None
         self.body_type = None
         self._status_t = 0.0
         self._last_save_bucket = -1
@@ -115,11 +139,10 @@ class EchoGridOS:
         if body_port is not None or auto_body:
             try:
                 from .body_client import FieldBodyClient
-                port = body_port if body_port else None
-                self.body = FieldBodyClient(port=port if port else None)
+                self.body = FieldBodyClient(port=body_port if body_port else None)
                 self.body.connect()
                 self.body_connected = True
-                print("[EchoGridOS] Field Body attached (optical/ultrasonic protocol)")
+                print("[EchoGridOS] Field Body attached")
             except Exception as e:
                 if body_port is not None:
                     print(f"[EchoGridOS] body unavailable ({e})")
@@ -143,8 +166,7 @@ class EchoGridOS:
         if obs is None:
             return
         self.body_type = obs.get("body_type")
-        regions = obs.get("regions") or []
-        for i, r in enumerate(regions):
+        for i, r in enumerate(obs.get("regions") or []):
             try:
                 val = float(r.get("observed", 0.0))
                 conf = float(r.get("confidence", 0.5))
@@ -152,11 +174,32 @@ class EchoGridOS:
                 continue
             if val < 0.02:
                 continue
-            name = str(r.get("region", i))
-            x, y = _region_xy(name, i)
-            # optical and ultrasonic share the same inject path into φ
+            x, y = _region_xy(str(r.get("region", i)), i)
             self.field.inject(x, y, force=0.55 * val * max(0.3, conf))
             self.last_obs = max(self.last_obs * 0.9, val)
+
+    def actuator_map(self, phi: Optional[np.ndarray] = None) -> np.ndarray:
+        """Living |Δf| image for display / future drivers."""
+        if phi is None:
+            phi = self.field.phi
+        spatial = None
+        if self.csi is not None:
+            spatial = self.csi.spatial_map(self.field.size)
+        dm = self.mapper.drive_map(
+            phi,
+            csi_spatial=spatial,
+            motion=self.last_csi_energy,
+            hold_hz=450.0,
+        )
+        # hold last frame softly so panel doesn't flicker to zero between packets
+        if self.last_drive_map is not None and self.last_drive_map.shape == dm.shape:
+            if float(dm.max()) < 15.0 and self.csi_packets > 0:
+                dm = np.maximum(dm, self.last_drive_map * 0.92)
+            else:
+                dm = 0.35 * self.last_drive_map + 0.65 * dm
+        self.last_drive_map = dm.astype(np.float32)
+        self.last_df_max = float(dm.max())
+        return self.last_drive_map
 
     def step(self, drive_body: bool = False, closed_loop: bool = True) -> np.ndarray:
         if self.csi is not None:
@@ -166,25 +209,25 @@ class EchoGridOS:
             tracks = self.csi.active_tracks()
             if tracks:
                 for tr in tracks:
-                    if tr.confidence < 0.28:
+                    if tr.confidence < 0.25:
                         continue
-                    gain = 0.75 if tr.state == "idle" else (1.15 if tr.state == "move" else 1.4)
-                    if tr.energy > 0.04:
-                        x, y = tr.pos
-                        self.field.inject(x, y, force=gain * tr.energy * max(0.4, tr.confidence))
-            elif self.last_csi_energy > 0.10:
-                self.field.inject(0.5, 0.5, force=0.55 * self.last_csi_energy)
+                    gain = 0.85 if tr.state == "idle" else (1.25 if tr.state == "move" else 1.5)
+                    if tr.energy > 0.03:
+                        self.field.inject(
+                            tr.pos[0], tr.pos[1],
+                            force=gain * tr.energy * max(0.35, tr.confidence),
+                        )
+            elif self.last_csi_energy > 0.08:
+                self.field.inject(0.5, 0.5, force=0.65 * self.last_csi_energy)
 
         self._ingest_body(closed_loop)
-
         phi = self.field.step()
-        self.last_df_max = float(np.max(self.mapper.delta_f_abs(phi)))
+        self.actuator_map(phi)
 
         if closed_loop and self.csi is not None:
-            ntr = len(self.csi.active_tracks())
             self.csi.closed_loop_feedback(
                 entropy=self.field.entropy,
-                n_tracks=ntr,
+                n_tracks=len(self.csi.active_tracks()),
                 motion=self.last_csi_energy,
                 df_max=self.last_df_max,
             )
@@ -203,12 +246,10 @@ class EchoGridOS:
         if now - self._status_t >= 1.2:
             self._status_t = now
             ntr = len(self.csi.active_tracks()) if self.csi else 0
-            cmds = self.csi.cmd_count if self.csi else 0
             print(
                 f"[field] entropy={self.field.entropy:.3f}  motion={self.last_csi_energy:.3f}  "
-                f"tracks={ntr}  body={self.body_type or ('on' if self.body_connected else 'off')}  "
-                f"obs={self.last_obs:.3f}  |Δf|_max={self.last_df_max:.0f}Hz  "
-                f"drive={self.field._drive:.2f}  t={self.t:.1f}s"
+                f"tracks={ntr}  |Δf|_max={self.last_df_max:.0f}Hz  "
+                f"drive={self.field._drive:.2f}  pkts={self.csi_packets}  t={self.t:.1f}s"
             )
         return phi
 
