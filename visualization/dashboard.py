@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Echo Grid live stack — CSI enabled by default
+Echo Grid live — CSI default; optional optical/ultrasonic body merge
 
   python visualization/dashboard.py
-  python visualization/dashboard.py --body          # + ultrasonic body
-  python visualization/dashboard.py --no-csi        # software field only (no RF)
+  python visualization/dashboard.py --body          # Field Body (optical-body-s3 or ultrasonic)
+  python visualization/dashboard.py --body --drive  # observe + excite
 """
 
 from __future__ import annotations
@@ -42,8 +42,10 @@ TRACK_COLORS = ["#ff4d6d", "#4cc9f0", "#f4a261", "#a0e8af", "#c77dff", "#ffe066"
 
 
 class LiveDashboard:
-    def __init__(self, size=16, body_port=None, csi_port=4210, drive=False, closed_loop=True):
-        self.osys = EchoGridOS(size=size, body_port=body_port, csi_port=csi_port)
+    def __init__(self, size=16, body_port=None, csi_port=4210, drive=False, closed_loop=True, auto_body=False):
+        self.osys = EchoGridOS(
+            size=size, body_port=body_port, csi_port=csi_port, auto_body=auto_body,
+        )
         self.drive = drive
         self.closed_loop = closed_loop
         self.size = size
@@ -92,9 +94,8 @@ class LiveDashboard:
         self.im_df = self.ax_df.imshow(
             z.copy(), cmap="inferno", vmin=0, vmax=400, origin="lower", extent=[0, 1, 0, 1],
         )
-        self.ax_df.set_title("3 · Actuator |Δf| (Hz from 40 kHz)", fontsize=11)
+        self.ax_df.set_title("3 · Actuator |Δf|", fontsize=11)
         self.cbar_df = self.fig.colorbar(self.im_df, ax=self.ax_df, fraction=0.046, pad=0.04)
-        self.cbar_df.set_label("|Hz|")
         self.df_readout = self.ax_df.text(
             0.02, 0.98, "|Δf| max —", transform=self.ax_df.transAxes,
             ha="left", va="top", fontsize=9, family="monospace", color="white",
@@ -105,7 +106,6 @@ class LiveDashboard:
         self.ax_hist.set_xlim(0, 200)
         self.ax_hist.set_ylim(0, 1.05)
         self.hist_line, = self.ax_hist.plot([], [], color="#00d4aa", lw=2.0)
-        self.ax_hist.axhline(0.3, color="#555", ls="--", lw=0.8)
         self.ax_bars = self.ax_hist.inset_axes([0.55, 0.55, 0.42, 0.4])
         self.ax_bars.set_xlim(-0.5, 16.5)
         self.ax_bars.set_ylim(0, 1)
@@ -118,20 +118,15 @@ class LiveDashboard:
             bits.append("body")
         if self.osys.csi_enabled:
             bits.append("csi")
-        if not bits:
-            bits.append("idle")
-        self.fig.suptitle(f"Echo Grid  ·  {'+'.join(bits)}", fontsize=13)
+        self.fig.suptitle(f"Echo Grid  ·  {'+'.join(bits) or 'idle'}", fontsize=13)
         self.status = self.fig.text(0.5, 0.01, "", ha="center", fontsize=9, family="monospace")
         self.fig.canvas.mpl_connect("close_event", lambda e: setattr(self, "_running", False))
 
     def _sub_bars(self):
-        if not self.osys.csi:
-            return np.zeros(16)
-        pkt = self.osys.csi.last_packet
-        if not pkt:
+        if not self.osys.csi or not self.osys.csi.last_packet:
             return np.zeros(16)
         try:
-            vals = np.array([float(x) for x in (pkt.get("csi") or [])], dtype=float)
+            vals = np.array([float(x) for x in (self.osys.csi.last_packet.get("csi") or [])], dtype=float)
         except (TypeError, ValueError):
             return np.zeros(16)
         if len(vals) == 0:
@@ -178,9 +173,10 @@ class LiveDashboard:
         self.im_csi.set_data(spatial)
         self.im_csi.set_clim(0.0, max(0.25, float(spatial.max()) + 1e-9))
         e = float(self.osys.last_csi_energy)
+        bt = self.osys.body_type or ("body" if self.osys.body_connected else "-")
         self.csi_readout.set_text(
             f"motion {e:.2f}   pkts {self.osys.csi_packets}\n"
-            f"tracks {len(tracks)}   rssi {self.osys.csi.last_rssi if self.osys.csi else 0:.0f}"
+            f"tracks {len(tracks)}   body {bt}  obs {self.osys.last_obs:.2f}"
         )
 
         df_abs = np.array(self.osys.mapper.delta_f_abs(phi_view), dtype=np.float32, copy=True)
@@ -196,7 +192,7 @@ class LiveDashboard:
         self.im_df.set_clim(0.0, max(120.0, self._df_clim))
         self.df_readout.set_text(
             f"|Δf| max {df_max:.0f} Hz   mean {df_mean:.0f}\n"
-            f"scale 0–{self._df_clim:.0f} Hz   drive {self.osys.field._drive:.2f}"
+            f"drive {self.osys.field._drive:.2f}  obs {self.osys.last_obs:.2f}"
         )
 
         hist = self.osys.csi.motion_history if self.osys.csi else []
@@ -209,8 +205,7 @@ class LiveDashboard:
 
         self.status.set_text(
             f"frame={self._frame}  motion={e:.3f}  tracks={len(tracks)}  "
-            f"|Δf|_max={df_max:.0f}Hz  drive={self.osys.field._drive:.2f}  "
-            f"pkts={self.osys.csi_packets}  t={self.osys.t:.1f}s"
+            f"body={bt}  obs={self.osys.last_obs:.2f}  |Δf|_max={df_max:.0f}Hz"
         )
 
         now = time.time()
@@ -218,13 +213,13 @@ class LiveDashboard:
             self._last_log = now
             print(
                 f"[live] |Δf|_max={df_max:.1f}  drive={self.osys.field._drive:.2f}  "
-                f"motion={e:.3f}  tracks={len(tracks)}  pkts={self.osys.csi_packets}"
+                f"motion={e:.3f}  body={bt}  obs={self.osys.last_obs:.2f}"
             )
 
     def run(self):
         if _BACKEND == "Agg":
             print("No GUI backend"); self.osys.close(); return
-        print(f"[dashboard] backend={_BACKEND}  csi={'on' if self.osys.csi_enabled else 'off'}")
+        print(f"[dashboard] backend={_BACKEND}")
         plt.show(block=False)
         self.fig.canvas.draw()
         try:
@@ -247,19 +242,21 @@ class LiveDashboard:
 
 
 def main():
-    p = argparse.ArgumentParser(description="Echo Grid live dashboard (CSI default on)")
+    p = argparse.ArgumentParser()
     p.add_argument("--body", nargs="?", const="", default=None,
-                   help="attach ultrasonic body serial (optional port)")
-    p.add_argument("--csi", nargs="?", const=4210, type=int, default=4210,
-                   help="CSI UDP port (default 4210)")
-    p.add_argument("--no-csi", action="store_true", help="disable CSI input")
-    p.add_argument("--drive", action="store_true", help="drive body emitters from field")
-    p.add_argument("--no-loop", action="store_true", help="disable closed-loop feedback")
+                   help="Field Body serial (optical-body-s3 or ultrasonic). Empty = auto-detect.")
+    p.add_argument("--csi", nargs="?", const=4210, type=int, default=4210)
+    p.add_argument("--no-csi", action="store_true")
+    p.add_argument("--drive", action="store_true", help="EXCITE body emitters from field peaks")
+    p.add_argument("--no-loop", action="store_true")
     p.add_argument("--size", type=int, default=16)
     a = p.parse_args()
 
     csi_port = None if a.no_csi else a.csi
-    LiveDashboard(a.size, a.body, csi_port, a.drive, not a.no_loop).run()
+    LiveDashboard(
+        a.size, a.body, csi_port, a.drive, not a.no_loop,
+        auto_body=False,
+    ).run()
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Echo Grid — visible equilibrium field under CSI drive."""
+"""Echo Grid — CSI + optical/ultrasonic Field Body closed loop."""
 
 from __future__ import annotations
 
@@ -40,11 +40,9 @@ class EchoFieldOS:
         self.vel += (lap - self.phi) * self.lmbda
         self.vel *= self.gamma
         self.phi += self.vel
-
         self._drive *= 0.97
         if self._drive < 0.05:
             self.phi *= 0.995
-
         np.clip(self.phi, -self.max_abs, self.max_abs, out=self.phi)
         np.clip(self.vel, -self.max_abs, self.max_abs, out=self.vel)
         self.entropy = float(np.std(self.phi))
@@ -57,12 +55,10 @@ class UltrasonicMapper:
         self.k = k
 
     def delta_f(self, field: np.ndarray) -> np.ndarray:
-        """Signed Hz offset from 40 kHz (zero-mean for symmetry)."""
         f = field - float(np.mean(field))
         return f * self.k
 
     def delta_f_abs(self, field: np.ndarray) -> np.ndarray:
-        """Absolute |Hz| map for high-visibility display."""
         return np.abs(self.delta_f(field))
 
     def region_energies(self, field: np.ndarray, n_emitters: int = 4) -> List[float]:
@@ -74,8 +70,32 @@ class UltrasonicMapper:
         return [float(np.mean(np.abs(r))) for r in regions[:n_emitters]]
 
 
+# Map named optical regions → unit-square inject points
+_REGION_XY = {
+    "center": (0.5, 0.5),
+    "n": (0.5, 0.75), "s": (0.5, 0.25), "e": (0.75, 0.5), "w": (0.25, 0.5),
+    "ne": (0.75, 0.75), "nw": (0.25, 0.75), "se": (0.75, 0.25), "sw": (0.25, 0.25),
+    "0": (0.25, 0.25), "1": (0.75, 0.25), "2": (0.25, 0.75), "3": (0.75, 0.75),
+}
+
+
+def _region_xy(name: str, index: int) -> tuple:
+    key = str(name).lower().strip()
+    if key in _REGION_XY:
+        return _REGION_XY[key]
+    # fall back to quadrant from index
+    corners = [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)]
+    return corners[index % 4]
+
+
 class EchoGridOS:
-    def __init__(self, size: int = 16, body_port: Optional[str] = None, csi_port: Optional[int] = None):
+    def __init__(
+        self,
+        size: int = 16,
+        body_port: Optional[str] = None,
+        csi_port: Optional[int] = None,
+        auto_body: bool = False,
+    ):
         self.field = EchoFieldOS(size)
         self.mapper = UltrasonicMapper()
         self.t = 0.0
@@ -86,19 +106,24 @@ class EchoGridOS:
         self.last_csi_energy = 0.0
         self.csi_packets = 0
         self.last_df_max = 0.0
+        self.body_type = None
         self._status_t = 0.0
         self._last_save_bucket = -1
         self.body_connected = False
         self.csi_enabled = False
 
-        if body_port is not None:
+        if body_port is not None or auto_body:
             try:
                 from .body_client import FieldBodyClient
-                self.body = FieldBodyClient(port=body_port if body_port else None)
+                port = body_port if body_port else None
+                self.body = FieldBodyClient(port=port if port else None)
                 self.body.connect()
                 self.body_connected = True
+                print("[EchoGridOS] Field Body attached (optical/ultrasonic protocol)")
             except Exception as e:
-                print(f"[EchoGridOS] body unavailable ({e})")
+                if body_port is not None:
+                    print(f"[EchoGridOS] body unavailable ({e})")
+                self.body = None
 
         if csi_port is not None:
             try:
@@ -110,6 +135,28 @@ class EchoGridOS:
 
     def touch(self, x: float, y: float, strength: float = 1.0):
         self.field.inject(x, y, strength)
+
+    def _ingest_body(self, closed_loop: bool):
+        if not closed_loop or self.body is None:
+            return
+        obs = self.body.poll_observation()
+        if obs is None:
+            return
+        self.body_type = obs.get("body_type")
+        regions = obs.get("regions") or []
+        for i, r in enumerate(regions):
+            try:
+                val = float(r.get("observed", 0.0))
+                conf = float(r.get("confidence", 0.5))
+            except (TypeError, ValueError):
+                continue
+            if val < 0.02:
+                continue
+            name = str(r.get("region", i))
+            x, y = _region_xy(name, i)
+            # optical and ultrasonic share the same inject path into φ
+            self.field.inject(x, y, force=0.55 * val * max(0.3, conf))
+            self.last_obs = max(self.last_obs * 0.9, val)
 
     def step(self, drive_body: bool = False, closed_loop: bool = True) -> np.ndarray:
         if self.csi is not None:
@@ -128,15 +175,7 @@ class EchoGridOS:
             elif self.last_csi_energy > 0.10:
                 self.field.inject(0.5, 0.5, force=0.55 * self.last_csi_energy)
 
-        if closed_loop and self.body is not None:
-            obs = self.body.poll_observation()
-            if obs is not None:
-                regions = obs.get("regions", [])
-                if regions:
-                    val = float(regions[0].get("observed", 0.0))
-                    self.last_obs = val
-                    if val > 0.01:
-                        self.field.inject(0.5, 0.5, force=val * 0.3)
+        self._ingest_body(closed_loop)
 
         phi = self.field.step()
         self.last_df_max = float(np.max(self.mapper.delta_f_abs(phi)))
@@ -167,8 +206,9 @@ class EchoGridOS:
             cmds = self.csi.cmd_count if self.csi else 0
             print(
                 f"[field] entropy={self.field.entropy:.3f}  motion={self.last_csi_energy:.3f}  "
-                f"tracks={ntr}  cmds={cmds}  |Δf|_max={self.last_df_max:.0f}Hz  "
-                f"drive={self.field._drive:.2f}  pkts={self.csi_packets}  t={self.t:.1f}s"
+                f"tracks={ntr}  body={self.body_type or ('on' if self.body_connected else 'off')}  "
+                f"obs={self.last_obs:.3f}  |Δf|_max={self.last_df_max:.0f}Hz  "
+                f"drive={self.field._drive:.2f}  t={self.t:.1f}s"
             )
         return phi
 
