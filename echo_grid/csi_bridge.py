@@ -1,6 +1,4 @@
-"""
-CSI Bridge — UDP :4210 + Kalman multi-target tracks.
-"""
+"""CSI Bridge — real packets only."""
 
 from __future__ import annotations
 
@@ -23,7 +21,7 @@ class CSIBridge:
         self.packet_count: int = 0
         self.last_rx_time: float = 0.0
         self._logged = 0
-        self.tracks = TrackStore(max_tracks=8, ttl_s=2.8)
+        self.tracks = TrackStore(max_tracks=6, ttl_s=2.2)
         self._open()
 
     def _open(self) -> None:
@@ -41,7 +39,7 @@ class CSIBridge:
                 pass
             self.sock.bind(("0.0.0.0", self.port))
             self.sock.settimeout(self.timeout)
-            print(f"[CSI] listening :{self.port} (Kalman multi-track)")
+            print(f"[CSI] listening :{self.port} (real-only tracker)")
         except OSError as e:
             print(f"[CSI] bind failed: {e}")
             self.sock = None
@@ -54,21 +52,11 @@ class CSIBridge:
                 pass
             self.sock = None
 
-    def _energy(self, pkt: Dict[str, Any]) -> float:
-        for key in ("movement_intensity", "activity", "confidence"):
-            if key in pkt and pkt[key] is not None:
-                try:
-                    return float(min(1.0, max(0.0, float(pkt[key]))))
-                except (TypeError, ValueError):
-                    pass
-        return 0.0
-
     def poll(self) -> Optional[Dict[str, Any]]:
         if self.sock is None:
             return None
-
         latest = None
-        latest_addr = None
+        addr = None
         while True:
             try:
                 data, addr = self.sock.recvfrom(8192)
@@ -79,7 +67,6 @@ class CSIBridge:
                 if not isinstance(pkt, dict):
                     continue
                 latest = pkt
-                latest_addr = addr
                 self.tracks.update_from_packet(pkt)
             except socket.timeout:
                 break
@@ -87,8 +74,8 @@ class CSIBridge:
                 break
 
         if latest is None:
-            if self.last_rx_time and (time.time() - self.last_rx_time) > 2.0:
-                self.last_energy *= 0.90
+            if self.last_rx_time and time.time() - self.last_rx_time > 2.0:
+                self.last_energy *= 0.88
                 if self.last_energy < 0.01:
                     self.last_energy = 0.0
             return None
@@ -96,16 +83,16 @@ class CSIBridge:
         self.last_packet = latest
         self.packet_count += 1
         self.last_rx_time = time.time()
-        self.last_energy = self._energy(latest)
+        self.last_energy = float(self.tracks.motion_energy)
         try:
             self.last_rssi = float(latest.get("rssi", -90))
         except (TypeError, ValueError):
             self.last_rssi = -90.0
 
-        if self._logged < 5:
+        if self._logged < 8:
             print(
-                f"[CSI] rx #{self.packet_count} from {latest_addr}  "
-                f"energy={self.last_energy:.3f}  tracks={len(self.tracks.active())}"
+                f"[CSI] rx #{self.packet_count} from {addr}  "
+                f"motion={self.last_energy:.3f}  tracks={len(self.tracks.active())}"
             )
             self._logged += 1
         return latest
@@ -113,12 +100,9 @@ class CSIBridge:
     def injection_point(self) -> Tuple[float, float, float]:
         active = self.active_tracks()
         if active:
-            t = active[0]
-            x, y = t.pos
-            return (x, y, min(1.2, t.energy))
-        if self.last_energy < 0.015:
-            return (0.5, 0.5, 0.0)
-        return (0.5, 0.5, min(1.2, self.last_energy))
+            x, y = active[0].pos
+            return x, y, min(1.2, active[0].energy)
+        return 0.5, 0.5, 0.0
 
     def active_tracks(self) -> List[KalmanTrack]:
         return self.tracks.active()
