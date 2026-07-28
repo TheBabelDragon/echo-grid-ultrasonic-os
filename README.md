@@ -5,44 +5,42 @@ Coupled oscillator field → ultrasonic phase/amplitude/frequency mapping → ph
 
 This is a software-defined spatial acoustic actuator system designed for phased ultrasonic arrays and distributed emitter swarms.
 
-## What it is
+It also serves as the **ultrasonic physical body** sibling to [optical-body-s3](https://github.com/TheBabelDragon/optical-body-s3) under a shared [Field Body Protocol](docs/FIELD_BODY_PROTOCOL.md).
 
-- **Field Kernel**: Continuous 2D coupled oscillator lattice (the computational brain)
-- **Mapper**: Deterministic translation of field state into ultrasonic parameters
-- **Hardware Abstraction**: UDP / SPI / FPGA / ESP32 ready
-- **Physical Output**: Interference fields, pressure nodes, localized force (when hardware is attached)
-
-## Quick Start
+## Quick Start (software only)
 
 ```bash
 pip install -r requirements.txt
 python main.py
 ```
 
-Optional visualization:
+## With physical Echo Body
+
 ```bash
-python visualization/dashboard.py
+# Flash firmware/echo_body.ino to an ESP32 first
+python main.py --body                # auto-detect serial port
+python main.py --body /dev/ttyUSB0   # explicit port
+python main.py --body --drive        # also map the live field onto emitters
 ```
 
 ## Project Structure
 
 ```
 echo-grid-ultrasonic-os/
-├── echo_grid/           # Core Python OS
-│   ├── __init__.py
-│   └── core.py           # Field + Mapper + Controller
-├── fpga/               # Verilog cores
-│   ├── echo_dds_channel.v
-│   └── echo_grid_top.v
-├── firmware/           # ESP32 swarm
-│   └── esp32_swarm.ino
-├── visualization/      # Live field viewer
-│   └── dashboard.py
+├── echo_grid/
+│   ├── core.py           # Field kernel + OS controller
+│   ├── body_client.py    # Field Body Protocol client
+│   └── __init__.py
+├── firmware/
+│   ├── echo_body.ino     # ESP32 ultrasonic body
+│   └── README.md
+├── fpga/                 # Verilog DDS cores
+├── visualization/
 ├── docs/
-│   └── ARCHITECTURE.md
+│   ├── ARCHITECTURE.md
+│   └── FIELD_BODY_PROTOCOL.md
 ├── main.py
-├── requirements.txt
-└── LICENSE
+└── requirements.txt
 ```
 
 ## Core Equation
@@ -51,30 +49,6 @@ $$
 \phi_{t+1} = \phi_t + \lambda \nabla^2 \phi_t - \gamma \phi_t + \omega
 $$
 
-Where:
-- $\phi$ = field state
-- $\lambda$ = coupling strength
-- $\gamma$ = damping
-- $\omega$ = external excitation
-
-## Ultrasonic Mapping
-
-```
-freq  = 40000 + k * φ
-amp   = |φ|
-phase = φ
-```
-
-## Hardware Paths
-
-1. **Simulation only** → run `main.py`
-2. **ESP32 swarm** → flash `firmware/esp32_swarm.ino`
-3. **FPGA coherent array** → synthesize `fpga/echo_grid_top.v`
-
 ## License
 
-MIT License — see [LICENSE](LICENSE)
-
----
-
-Built as a complete, self-contained reference implementation of a field-native ultrasonic computing system.
+MIT
