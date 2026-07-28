@@ -1,4 +1,4 @@
-"""CSI Bridge — :4210 in, closed-loop cmds + field telemetry on :4211."""
+"""CSI Bridge — multi-node registry, :4210 in, cmds :4211."""
 
 from __future__ import annotations
 
@@ -28,11 +28,14 @@ class CSIBridge:
         self._logged = 0
         self._last_cmd_t = 0.0
         self._last_mode = ""
-        self.tracks = TrackStore(max_tracks=6, ttl_s=2.2)
+        self.tracks = TrackStore(max_tracks=6, ttl_s=2.4)
         self.last_vals: Optional[np.ndarray] = None
         self.last_residual: Optional[np.ndarray] = None
         self.motion_history: List[float] = []
         self.cmd_count = 0
+        # multi-node registry: node_id -> {packet, addr, t, motion}
+        self.nodes: Dict[str, Dict[str, Any]] = {}
+        self._replay_queue: List[Dict[str, Any]] = []
         self._open()
 
     def _open(self) -> None:
@@ -73,6 +76,9 @@ class CSIBridge:
         self.sock = None
         self.cmd_sock = None
 
+    def queue_replay(self, packets: List[Dict[str, Any]]) -> None:
+        self._replay_queue.extend(packets)
+
     def send_command(self, cmd: str, **fields: Any) -> bool:
         if self.cmd_sock is None:
             return False
@@ -105,13 +111,13 @@ class CSIBridge:
             return
         self._last_cmd_t = now
 
-        # Always push field telemetry so CYD can mirror the grid
         self.send_command(
             "field",
             entropy=round(float(entropy), 3),
             tracks=int(n_tracks),
             motion=round(float(motion), 3),
             df_max=round(float(df_max), 1),
+            nodes=len(self.nodes),
         )
 
         if n_tracks >= 2 or motion > 0.55 or entropy > 0.45:
@@ -127,12 +133,47 @@ class CSIBridge:
             self.send_command("set_rate", interval_ms=interval)
 
         if mode != self._last_mode:
-            print(f"[CSI] closed-loop → {mode} (H={entropy:.2f} tracks={n_tracks} df={df_max:.0f})")
+            print(
+                f"[CSI] closed-loop → {mode} "
+                f"(H={entropy:.2f} tracks={n_tracks} nodes={len(self.nodes)} df={df_max:.0f})"
+            )
             self._last_mode = mode
 
+    def _ingest(self, pkt: Dict[str, Any], addr: Optional[Tuple[str, int]] = None) -> None:
+        node = str(pkt.get("node") or (addr[0] if addr else "unknown"))
+        self.nodes[node] = {
+            "packet": pkt,
+            "addr": addr,
+            "t": time.time(),
+            "rssi": pkt.get("rssi", -90),
+        }
+        if addr:
+            self.last_addr = addr
+        self.tracks.update_from_packet(pkt)
+        self.last_packet = pkt
+        self.packet_count += 1
+        self.last_rx_time = time.time()
+        self.last_energy = float(self.tracks.motion_energy)
+        self.last_vals = getattr(self.tracks, "last_vals", None)
+        self.last_residual = getattr(self.tracks, "last_residual", None)
+        self.motion_history.append(self.last_energy)
+        if len(self.motion_history) > 200:
+            self.motion_history = self.motion_history[-200:]
+        try:
+            self.last_rssi = float(pkt.get("rssi", -90))
+        except (TypeError, ValueError):
+            self.last_rssi = -90.0
+
     def poll(self) -> Optional[Dict[str, Any]]:
+        # offline replay first
+        if self._replay_queue:
+            pkt = self._replay_queue.pop(0)
+            self._ingest(pkt, None)
+            return pkt
+
         if self.sock is None:
             return None
+
         latest = None
         addr = None
         while True:
@@ -144,10 +185,8 @@ class CSIBridge:
                     continue
                 if not isinstance(pkt, dict):
                     continue
+                self._ingest(pkt, addr)
                 latest = pkt
-                if addr:
-                    self.last_addr = addr
-                self.tracks.update_from_packet(pkt)
             except socket.timeout:
                 break
             except OSError:
@@ -158,27 +197,27 @@ class CSIBridge:
                 self.last_energy *= 0.88
                 if self.last_energy < 0.01:
                     self.last_energy = 0.0
+            # expire stale nodes
+            now = time.time()
+            self.nodes = {k: v for k, v in self.nodes.items() if now - v["t"] < 5.0}
             return None
 
-        self.last_packet = latest
-        self.packet_count += 1
-        self.last_rx_time = time.time()
-        self.last_energy = float(self.tracks.motion_energy)
-        self.last_vals = getattr(self.tracks, "last_vals", None)
-        self.last_residual = getattr(self.tracks, "last_residual", None)
-        self.motion_history.append(self.last_energy)
-        if len(self.motion_history) > 200:
-            self.motion_history = self.motion_history[-200:]
-
-        try:
-            self.last_rssi = float(latest.get("rssi", -90))
-        except (TypeError, ValueError):
-            self.last_rssi = -90.0
-
-        if self._logged < 6:
-            print(f"[CSI] rx #{self.packet_count} from {addr} motion={self.last_energy:.3f}")
+        if self._logged < 8:
+            node = latest.get("node", "?")
+            print(
+                f"[CSI] rx #{self.packet_count} node={node} "
+                f"nodes={len(self.nodes)} motion={self.last_energy:.3f}"
+            )
             self._logged += 1
         return latest
+
+    def node_summary(self) -> str:
+        if not self.nodes:
+            return "no nodes"
+        parts = []
+        for nid, info in list(self.nodes.items())[:4]:
+            parts.append(f"{nid}")
+        return ",".join(parts)
 
     def spatial_map(self, size: int = 16) -> np.ndarray:
         grid = np.zeros((size, size), dtype=np.float32)
@@ -219,13 +258,6 @@ class CSIBridge:
 
         m = float(grid.max()) + 1e-9
         return grid / m
-
-    def injection_point(self) -> Tuple[float, float, float]:
-        active = self.active_tracks()
-        if active:
-            x, y = active[0].pos
-            return x, y, min(1.2, active[0].energy)
-        return 0.5, 0.5, 0.0
 
     def active_tracks(self) -> List[KalmanTrack]:
         return self.tracks.active()
