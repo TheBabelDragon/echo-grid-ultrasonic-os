@@ -1,5 +1,5 @@
 """
-Echo Grid Ultrasonic OS — Core Kernel (production-hardened)
+Echo Grid Ultrasonic OS — Core Kernel (CSI-interactive)
 """
 
 from __future__ import annotations
@@ -13,16 +13,14 @@ import numpy as np
 
 
 class EchoFieldOS:
-    """2D coupled oscillator lattice with soft energy limits."""
-
     def __init__(self, size: int = 16):
         self.size = size
         self.phi = np.zeros((size, size), dtype=np.float32)
         self.vel = np.zeros((size, size), dtype=np.float32)
         self.lmbda = 0.08
-        self.gamma = 0.94          # slightly stronger damping
+        self.gamma = 0.94
         self.entropy = 0.0
-        self.max_abs = 4.0         # soft clamp on field amplitude
+        self.max_abs = 4.0
 
     def inject(self, x: float, y: float, force: float = 1.0):
         ix = int(np.clip(x * self.size, 0, self.size - 1))
@@ -46,7 +44,6 @@ class EchoFieldOS:
         self.vel *= self.gamma
         self.phi += self.vel
 
-        # Soft energy clamp — prevents runaway in long runs
         np.clip(self.phi, -self.max_abs, self.max_abs, out=self.phi)
         np.clip(self.vel, -self.max_abs, self.max_abs, out=self.vel)
 
@@ -65,8 +62,7 @@ class UltrasonicMapper:
             for x in range(field.shape[1]):
                 v = float(field[y, x])
                 packets.append({
-                    "x": x,
-                    "y": y,
+                    "x": x, "y": y,
                     "freq": self.base_freq + v * self.k,
                     "amp": min(1.0, abs(v) / 4.0),
                     "phase": v,
@@ -90,16 +86,24 @@ class UltrasonicMapper:
 
 
 class EchoGridOS:
-    def __init__(self, size: int = 16, body_port: Optional[str] = None):
+    def __init__(
+        self,
+        size: int = 16,
+        body_port: Optional[str] = None,
+        csi_port: Optional[int] = None,
+    ):
         self.field = EchoFieldOS(size)
         self.mapper = UltrasonicMapper()
         self.t = 0.0
         self.save_path = Path("echo_save.json")
         self.body = None
+        self.csi = None
         self.last_obs = 0.0
+        self.last_csi_energy = 0.0
         self._status_t = 0.0
         self._last_save_bucket = -1
         self.body_connected = False
+        self.csi_enabled = False
 
         if body_port is not None:
             try:
@@ -107,17 +111,33 @@ class EchoGridOS:
                 self.body = FieldBodyClient(port=body_port if body_port else None)
                 self.body.connect()
                 self.body_connected = True
-                print("[EchoGridOS] body attached — closed loop active")
+                print("[EchoGridOS] body attached")
             except Exception as e:
-                print(f"[EchoGridOS] body unavailable ({e}) — software-only mode")
+                print(f"[EchoGridOS] body unavailable ({e})")
                 self.body = None
-                self.body_connected = False
+
+        if csi_port is not None:
+            try:
+                from .csi_bridge import CSIBridge
+                self.csi = CSIBridge(port=csi_port if csi_port else 4210)
+                self.csi_enabled = self.csi.sock is not None
+            except Exception as e:
+                print(f"[EchoGridOS] CSI unavailable ({e})")
+                self.csi = None
 
     def touch(self, x: float, y: float, strength: float = 1.0):
         self.field.inject(x, y, strength)
 
     def step(self, drive_body: bool = False, closed_loop: bool = True) -> np.ndarray:
-        # Closed-loop intake
+        # --- CSI intake (WiFi sensing) ---
+        if self.csi is not None:
+            self.csi.poll()
+            x, y, force = self.csi.injection_point()
+            self.last_csi_energy = self.csi.last_energy
+            if force > 0.02:
+                self.field.inject(x, y, force=force * 0.85)
+
+        # --- ultrasonic body observation intake ---
         if closed_loop and self.body is not None:
             obs = self.body.poll_observation()
             if obs is not None:
@@ -125,12 +145,11 @@ class EchoGridOS:
                 if regions:
                     val = float(regions[0].get("observed", 0.0))
                     self.last_obs = val
-                    if val > 0.01:  # ignore pure noise floor
+                    if val > 0.01:
                         self.field.inject(0.5, 0.5, force=val * 0.30)
 
         phi = self.field.step()
 
-        # Drive emitters from spatial regions
         if drive_body and self.body is not None:
             energies = self.mapper.region_energies(phi, n_emitters=4)
             best = int(np.argmax(energies))
@@ -142,22 +161,28 @@ class EchoGridOS:
 
         self.t += 0.016
 
-        # Status line (~1.5 s)
         now = time.time()
         if now - self._status_t >= 1.5:
             self._status_t = now
-            body_state = "body" if self.body_connected else "soft"
+            mode_bits = []
+            if self.body_connected:
+                mode_bits.append("body")
+            if self.csi_enabled:
+                mode_bits.append("csi")
+            if not mode_bits:
+                mode_bits.append("soft")
+            mode = "+".join(mode_bits)
             print(
-                f"[field] mode={body_state}  "
+                f"[field] mode={mode}  "
                 f"entropy={self.field.entropy:.3f}  "
                 f"obs={self.last_obs:.3f}  "
+                f"csi={self.last_csi_energy:.3f}  "
                 f"t={self.t:.1f}s"
             )
 
         return phi
 
     def save(self, force: bool = False):
-        """Save at most once per 8-second bucket unless forced."""
         bucket = int(self.t) // 8
         if not force and bucket == self._last_save_bucket:
             return
@@ -182,3 +207,6 @@ class EchoGridOS:
             except Exception:
                 pass
             self.body_connected = False
+        if self.csi:
+            self.csi.close()
+            self.csi_enabled = False
