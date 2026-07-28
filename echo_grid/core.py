@@ -1,5 +1,5 @@
 """
-Echo Grid Ultrasonic OS — Core Kernel (closed-loop capable)
+Echo Grid Ultrasonic OS — Core Kernel (closed-loop + spatial mapping)
 """
 
 from __future__ import annotations
@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import numpy as np
 
@@ -61,6 +61,28 @@ class UltrasonicMapper:
                 })
         return packets
 
+    def region_energies(self, field: np.ndarray, n_emitters: int = 4) -> List[float]:
+        """Collapse the 2D field into n_emitters spatial bins (simple quadrant-style)."""
+        h, w = field.shape
+        energies = []
+        # For 4 emitters we use 2×2 spatial regions
+        if n_emitters == 4:
+            regions = [
+                field[0:h//2, 0:w//2],
+                field[0:h//2, w//2:w],
+                field[h//2:h, 0:w//2],
+                field[h//2:h, w//2:w],
+            ]
+            for r in regions:
+                energies.append(float(np.mean(np.abs(r))))
+        else:
+            # fallback: uniform slices
+            flat = np.abs(field).ravel()
+            chunk = max(1, len(flat) // n_emitters)
+            for i in range(n_emitters):
+                energies.append(float(np.mean(flat[i*chunk:(i+1)*chunk])))
+        return energies
+
 
 class EchoGridOS:
     def __init__(self, size: int = 16, body_port: Optional[str] = None):
@@ -69,14 +91,15 @@ class EchoGridOS:
         self.t = 0.0
         self.save_path = Path("echo_save.json")
         self.body = None
-        self._last_obs_force = 0.0
+        self.last_obs = 0.0
+        self._status_t = 0.0
 
         if body_port is not None:
             try:
                 from .body_client import FieldBodyClient
                 self.body = FieldBodyClient(port=body_port if body_port else None)
                 self.body.connect()
-                print("[EchoGridOS] physical body attached (closed-loop ready)")
+                print("[EchoGridOS] body attached — closed loop active")
             except Exception as e:
                 print(f"[EchoGridOS] body unavailable: {e}")
                 self.body = None
@@ -85,31 +108,42 @@ class EchoGridOS:
         self.field.inject(x, y, strength)
 
     def step(self, drive_body: bool = False, closed_loop: bool = True) -> np.ndarray:
-        # 1. Pull any observation from the body and fold it into the field
+        # --- closed-loop observation intake ---
         if closed_loop and self.body is not None:
             obs = self.body.poll_observation()
             if obs is not None:
                 regions = obs.get("regions", [])
                 if regions:
                     val = float(regions[0].get("observed", 0.0))
-                    # gentle feedback into the centre of the field
-                    self.field.inject(0.5, 0.5, force=val * 0.45)
-                    self._last_obs_force = val
+                    self.last_obs = val
+                    # gentle, stable feedback into the centre
+                    self.field.inject(0.5, 0.5, force=val * 0.35)
 
-        # 2. Evolve the field
+        # --- evolve pure field ---
         phi = self.field.step()
 
-        # 3. Optionally drive emitters from the field
+        # --- drive physical emitters from spatial regions ---
         if drive_body and self.body is not None:
-            flat = np.abs(phi).ravel()
-            strongest = int(np.argmax(flat))
-            emitter_id = strongest % 4
-            try:
-                self.body.excite(emitter_id)
-            except Exception:
-                pass
+            energies = self.mapper.region_energies(phi, n_emitters=4)
+            # fire the currently strongest region
+            best = int(np.argmax(energies))
+            if energies[best] > 0.04:          # small dead-zone
+                try:
+                    self.body.excite(best)
+                except Exception:
+                    pass
 
         self.t += 0.016
+
+        # --- occasional live status ---
+        if time.time() - self._status_t > 1.5:
+            self._status_t = time.time()
+            print(
+                f"[field] entropy={self.field.entropy:.3f}  "
+                f"obs={self.last_obs:.3f}  "
+                f"t={self.t:.1f}s"
+            )
+
         return phi
 
     def save(self):
@@ -120,7 +154,7 @@ class EchoGridOS:
         }
         with open(self.save_path, "w") as f:
             json.dump(data, f, indent=2)
-        print(f"✅ State saved → {self.save_path}")
+        print(f"✅ saved → {self.save_path}")
 
     def close(self):
         if self.body:
