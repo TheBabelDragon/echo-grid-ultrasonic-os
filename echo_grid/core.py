@@ -1,5 +1,5 @@
 """
-Echo Grid Ultrasonic OS — Core Kernel (CSI-interactive)
+Echo Grid Ultrasonic OS — Core Kernel (multi-track CSI)
 """
 
 from __future__ import annotations
@@ -26,7 +26,6 @@ class EchoFieldOS:
         ix = int(np.clip(x * self.size, 0, self.size - 1))
         iy = int(np.clip(y * self.size, 0, self.size - 1))
         force = float(np.clip(force, -2.0, 2.0))
-
         for j in range(self.size):
             for i in range(self.size):
                 dx = i - ix
@@ -39,14 +38,11 @@ class EchoFieldOS:
             np.roll(self.phi, 1, 0) + np.roll(self.phi, -1, 0) +
             np.roll(self.phi, 1, 1) + np.roll(self.phi, -1, 1)
         ) * 0.25
-
         self.vel += (lap - self.phi) * self.lmbda
         self.vel *= self.gamma
         self.phi += self.vel
-
         np.clip(self.phi, -self.max_abs, self.max_abs, out=self.phi)
         np.clip(self.vel, -self.max_abs, self.max_abs, out=self.vel)
-
         self.entropy = float(np.std(self.phi))
         return self.phi.copy()
 
@@ -79,7 +75,6 @@ class UltrasonicMapper:
                 field[h//2:h, w//2:w],
             ]
             return [float(np.mean(np.abs(r))) for r in regions]
-
         flat = np.abs(field).ravel()
         chunk = max(1, len(flat) // n_emitters)
         return [float(np.mean(flat[i*chunk:(i+1)*chunk])) for i in range(n_emitters)]
@@ -135,9 +130,16 @@ class EchoGridOS:
             self.csi.poll()
             self.last_csi_energy = self.csi.last_energy
             self.csi_packets = self.csi.packet_count
-            x, y, force = self.csi.injection_point()
-            if force > 0.015:
-                self.field.inject(x, y, force=force * 0.9)
+            # multi-track field injection
+            tracks = self.csi.active_tracks()
+            if tracks:
+                for tr in tracks:
+                    if tr.energy > 0.02:
+                        self.field.inject(tr.x, tr.y, force=tr.energy * 0.75)
+            else:
+                x, y, force = self.csi.injection_point()
+                if force > 0.015:
+                    self.field.inject(x, y, force=force * 0.9)
 
         if closed_loop and self.body is not None:
             obs = self.body.poll_observation()
@@ -165,6 +167,9 @@ class EchoGridOS:
         now = time.time()
         if now - self._status_t >= 1.5:
             self._status_t = now
+            ntr = 0
+            if self.csi is not None:
+                ntr = len(self.csi.active_tracks())
             mode_bits = []
             if self.body_connected:
                 mode_bits.append("body")
@@ -175,9 +180,8 @@ class EchoGridOS:
             print(
                 f"[field] mode={'+'.join(mode_bits)}  "
                 f"entropy={self.field.entropy:.3f}  "
-                f"obs={self.last_obs:.3f}  "
                 f"csi={self.last_csi_energy:.3f}  "
-                f"pkts={self.csi_packets}  "
+                f"tracks={ntr}  pkts={self.csi_packets}  "
                 f"t={self.t:.1f}s"
             )
 
@@ -188,7 +192,6 @@ class EchoGridOS:
         if not force and bucket == self._last_save_bucket:
             return
         self._last_save_bucket = bucket
-
         data = {
             "phi": self.field.phi.tolist(),
             "vel": self.field.vel.tolist(),

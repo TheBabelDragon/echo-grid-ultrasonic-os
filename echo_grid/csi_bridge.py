@@ -1,5 +1,5 @@
 """
-CSI Bridge — UDP :4210 from wifi-sensing-system ESP32 nodes.
+CSI Bridge — UDP :4210 + multi-body track store.
 """
 
 from __future__ import annotations
@@ -8,6 +8,8 @@ import json
 import socket
 import time
 from typing import Any, Dict, List, Optional, Tuple
+
+from .csi_tracks import Track, TrackStore
 
 
 class CSIBridge:
@@ -22,6 +24,7 @@ class CSIBridge:
         self.last_rx_time: float = 0.0
         self._baseline: Optional[List[float]] = None
         self._logged = 0
+        self.tracks = TrackStore(max_tracks=6, ttl_s=3.0)
         self._open()
 
     def _open(self) -> None:
@@ -39,10 +42,9 @@ class CSIBridge:
                 pass
             self.sock.bind(("0.0.0.0", self.port))
             self.sock.settimeout(self.timeout)
-            print(f"[CSI] listening UDP 0.0.0.0:{self.port} (broadcast OK)")
+            print(f"[CSI] listening UDP 0.0.0.0:{self.port} (multi-track)")
         except OSError as e:
             print(f"[CSI] bind failed on :{self.port} ({e})")
-            print("      Is another process using 4210?  sudo ss -ulnp | grep 4210")
             self.sock = None
 
     def close(self) -> None:
@@ -54,7 +56,6 @@ class CSIBridge:
             self.sock = None
 
     def _energy_from_packet(self, pkt: Dict[str, Any]) -> float:
-        # Prefer node-computed features (stable)
         candidates = []
         for key in ("movement_intensity", "activity", "confidence"):
             if key in pkt and pkt[key] is not None:
@@ -70,20 +71,15 @@ class CSIBridge:
             csi_f = [float(x) for x in csi]
         except (TypeError, ValueError):
             return 0.0
-
         if not csi_f:
             return 0.0
-
         if self._baseline is None or len(self._baseline) != len(csi_f):
             self._baseline = list(csi_f)
-            return 0.05  # first frame — small presence pulse
-
+            return 0.05
         dev = [abs(a - b) for a, b in zip(csi_f, self._baseline)]
         energy = sum(dev) / max(1, len(dev))
         alpha = 0.05
-        self._baseline = [
-            (1 - alpha) * b + alpha * a for a, b in zip(csi_f, self._baseline)
-        ]
+        self._baseline = [(1 - alpha) * b + alpha * a for a, b in zip(csi_f, self._baseline)]
         return float(min(1.0, energy * 4.0))
 
     def poll(self) -> Optional[Dict[str, Any]]:
@@ -98,21 +94,19 @@ class CSIBridge:
                 try:
                     pkt = json.loads(data.decode("utf-8", errors="ignore"))
                 except json.JSONDecodeError:
-                    if self._logged < 3:
-                        print(f"[CSI] bad JSON from {addr}: {data[:80]!r}")
-                        self._logged += 1
                     continue
                 if not isinstance(pkt, dict):
                     continue
                 latest = pkt
                 latest_addr = addr
+                # update tracks for every packet in the drain
+                self.tracks.update_from_packet(pkt)
             except socket.timeout:
                 break
             except OSError:
                 break
 
         if latest is None:
-            # soft decay if silent > 2s
             if self.last_rx_time and (time.time() - self.last_rx_time) > 2.0:
                 self.last_energy *= 0.92
                 if self.last_energy < 0.01:
@@ -123,7 +117,6 @@ class CSIBridge:
         self.packet_count += 1
         self.last_rx_time = time.time()
         self.last_energy = self._energy_from_packet(latest)
-
         try:
             self.last_rssi = float(latest.get("rssi", -90))
         except (TypeError, ValueError):
@@ -132,8 +125,7 @@ class CSIBridge:
         if self._logged < 5:
             print(
                 f"[CSI] rx #{self.packet_count} from {latest_addr}  "
-                f"energy={self.last_energy:.3f}  rssi={self.last_rssi:.0f}  "
-                f"keys={list(latest.keys())[:8]}"
+                f"energy={self.last_energy:.3f}  tracks={len(self.tracks.active())}"
             )
             self._logged += 1
 
@@ -143,22 +135,11 @@ class CSIBridge:
         force = self.last_energy
         if force < 0.015:
             return (0.5, 0.5, 0.0)
+        active = self.tracks.active()
+        if active:
+            t = active[0]
+            return (t.x, t.y, min(1.2, t.energy))
+        return (0.5, 0.5, min(1.2, force))
 
-        pkt = self.last_packet or {}
-        csi = pkt.get("csi") or []
-        try:
-            csi_f = [float(x) for x in csi]
-        except (TypeError, ValueError):
-            csi_f = []
-
-        if len(csi_f) >= 8:
-            mid = len(csi_f) // 2
-            left = sum(csi_f[:mid]) / mid
-            right = sum(csi_f[mid:]) / max(1, len(csi_f) - mid)
-            total = left + right + 1e-6
-            x = 0.30 + 0.40 * (right / total)
-            y = 0.40 + 0.20 * force
-        else:
-            x, y = 0.5, 0.5
-
-        return (x, y, min(1.2, force))
+    def active_tracks(self) -> List[Track]:
+        return self.tracks.active()
