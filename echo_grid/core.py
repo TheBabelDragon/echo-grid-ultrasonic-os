@@ -1,4 +1,4 @@
-"""Echo Grid — real CSI/body drive the field hard enough to see Δf."""
+"""Echo Grid — real CSI/body with bounded field (no Δf runaway)."""
 
 from __future__ import annotations
 
@@ -15,20 +15,21 @@ class EchoFieldOS:
         self.size = size
         self.phi = np.zeros((size, size), dtype=np.float32)
         self.vel = np.zeros((size, size), dtype=np.float32)
-        self.lmbda = 0.10
-        self.gamma = 0.94
+        self.lmbda = 0.09
+        self.gamma = 0.90          # stronger damping — stops red flood
+        self.max_abs = 2.5
         self.entropy = 0.0
-        self.max_abs = 4.0
 
     def inject(self, x: float, y: float, force: float = 1.0):
         ix = int(np.clip(x * self.size, 0, self.size - 1))
         iy = int(np.clip(y * self.size, 0, self.size - 1))
-        force = float(np.clip(force, -3.0, 3.0))
+        # soft-cap force so continuous CSI cannot pile up forever
+        force = float(np.clip(force, -1.2, 1.2))
         for j in range(self.size):
             for i in range(self.size):
                 dx, dy = i - ix, j - iy
                 d2 = dx * dx + dy * dy + 1e-6
-                self.vel[j, i] += np.exp(-d2 * 0.12) * force
+                self.vel[j, i] += np.exp(-d2 * 0.18) * force
 
     def step(self) -> np.ndarray:
         lap = (
@@ -38,6 +39,8 @@ class EchoFieldOS:
         self.vel += (lap - self.phi) * self.lmbda
         self.vel *= self.gamma
         self.phi += self.vel
+        # leak toward zero so steady injection reaches equilibrium, not infinity
+        self.phi *= 0.997
         np.clip(self.phi, -self.max_abs, self.max_abs, out=self.phi)
         np.clip(self.vel, -self.max_abs, self.max_abs, out=self.vel)
         self.entropy = float(np.std(self.phi))
@@ -45,14 +48,14 @@ class EchoFieldOS:
 
 
 class UltrasonicMapper:
-    """Field → actuator encoding: f = 40000 + k·φ, amp = |φ|."""
-
-    def __init__(self, base_freq: int = 40000, k: float = 2000.0):
+    def __init__(self, base_freq: int = 40000, k: float = 1500.0):
         self.base_freq = base_freq
         self.k = k
 
     def delta_f(self, field: np.ndarray) -> np.ndarray:
-        return field * self.k
+        # zero-mean so panel shows structure, not a global red bias
+        f = field - float(np.mean(field))
+        return f * self.k
 
     def region_energies(self, field: np.ndarray, n_emitters: int = 4) -> List[float]:
         h, w = field.shape
@@ -107,13 +110,15 @@ class EchoGridOS:
             tracks = self.csi.active_tracks()
             if tracks:
                 for tr in tracks:
-                    if tr.energy > 0.04:
+                    # only confident moving/surging bodies drive the field hard
+                    if tr.confidence < 0.35:
+                        continue
+                    gain = 0.55 if tr.state == "idle" else (0.9 if tr.state == "move" else 1.15)
+                    if tr.energy > 0.06:
                         x, y = tr.pos
-                        # stronger real inject so φ and Δf actually develop
-                        self.field.inject(x, y, force=1.1 * tr.energy * max(0.35, tr.confidence))
-            elif self.last_csi_energy > 0.08:
-                # motion without stable track still drives center mass
-                self.field.inject(0.5, 0.5, force=0.7 * self.last_csi_energy)
+                        self.field.inject(x, y, force=gain * tr.energy * tr.confidence)
+            elif self.last_csi_energy > 0.15:
+                self.field.inject(0.5, 0.5, force=0.35 * self.last_csi_energy)
 
         if closed_loop and self.body is not None:
             obs = self.body.poll_observation()
@@ -123,7 +128,7 @@ class EchoGridOS:
                     val = float(regions[0].get("observed", 0.0))
                     self.last_obs = val
                     if val > 0.01:
-                        self.field.inject(0.5, 0.5, force=val * 0.35)
+                        self.field.inject(0.5, 0.5, force=val * 0.25)
 
         phi = self.field.step()
 
