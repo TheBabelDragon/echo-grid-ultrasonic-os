@@ -2,8 +2,10 @@
 """
 Capture CSI packets to JSONL with optional labels.
 
+  python tools/capture_csi.py
   python tools/capture_csi.py -o data/session.jsonl
-  Labels (type + Enter):  e=empty  1=one  2=two  w=walk  s=still  q=quit
+
+Labels (type + Enter):  e=empty  1=one  2=two  w=walk  s=still  q=quit
 """
 
 from __future__ import annotations
@@ -15,6 +17,10 @@ import socket
 import sys
 import time
 from pathlib import Path
+
+# repo root = parent of tools/
+_ROOT = Path(__file__).resolve().parents[1]
+_DEFAULT_OUT = _ROOT / "data" / "session.jsonl"
 
 LABEL_KEYS = {
     "e": "empty",
@@ -29,28 +35,40 @@ LABEL_KEYS = {
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("-o", "--output", default="data/csi_capture.jsonl")
+    p.add_argument(
+        "-o", "--output",
+        default=str(_DEFAULT_OUT),
+        help=f"JSONL path (default: {_DEFAULT_OUT})",
+    )
     p.add_argument("--port", type=int, default=4210)
     a = p.parse_args()
 
-    out = Path(a.output)
+    out = Path(a.output).expanduser()
+    if not out.is_absolute():
+        out = (_ROOT / out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("0.0.0.0", a.port))
+    try:
+        sock.bind(("0.0.0.0", a.port))
+    except OSError as e:
+        raise SystemExit(
+            f"Cannot bind UDP :{a.port} ({e}).\n"
+            "Stop the dashboard if it is holding the port, or pass --port 4212."
+        ) from e
     sock.settimeout(0.3)
 
     label = "unknown"
     n = 0
-    print(f"[capture] :{a.port} → {out}")
+    print(f"[capture] listening :{a.port}")
+    print(f"[capture] writing → {out}")
     print("labels: e empty | 1/2/3 persons | w walk | s still | q quit")
     print(f"current label={label}")
 
-    with out.open("a") as f:
-        try:
+    try:
+        with out.open("a", encoding="utf-8") as f:
             while True:
-                # non-blocking stdin label
                 if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
                     line = sys.stdin.readline().strip().lower()
                     if line == "q":
@@ -66,6 +84,7 @@ def main():
                     data, addr = sock.recvfrom(8192)
                 except socket.timeout:
                     continue
+
                 try:
                     pkt = json.loads(data.decode("utf-8", errors="ignore"))
                 except json.JSONDecodeError:
@@ -89,10 +108,11 @@ def main():
                 n += 1
                 if n % 20 == 0:
                     print(f"[capture] {n} packets  label={label}  node={row.get('node')}")
-        except KeyboardInterrupt:
-            pass
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sock.close()
 
-    sock.close()
     print(f"done — {n} rows → {out}")
 
 

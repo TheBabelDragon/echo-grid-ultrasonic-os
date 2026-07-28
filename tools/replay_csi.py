@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Replay a JSONL capture into Echo Grid (UDP localhost or in-process)."""
+"""
+Replay a JSONL capture into Echo Grid via UDP.
+
+  python tools/replay_csi.py
+  python tools/replay_csi.py data/session.jsonl --loop --rate 15
+"""
 
 from __future__ import annotations
 
@@ -9,10 +14,13 @@ import socket
 import time
 from pathlib import Path
 
+_ROOT = Path(__file__).resolve().parents[1]
+_DEFAULT = _ROOT / "data" / "session.jsonl"
+
 
 def load_rows(path: Path):
     rows = []
-    with path.open() as f:
+    with path.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -26,20 +34,39 @@ def load_rows(path: Path):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("file", type=Path)
+    p.add_argument(
+        "file",
+        nargs="?",
+        type=Path,
+        default=_DEFAULT,
+        help=f"JSONL capture (default: {_DEFAULT})",
+    )
     p.add_argument("--port", type=int, default=4210)
     p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--rate", type=float, default=20.0, help="packets per second")
+    p.add_argument("--rate", type=float, default=20.0)
     p.add_argument("--loop", action="store_true")
     a = p.parse_args()
 
-    rows = load_rows(a.file)
+    path = a.file.expanduser()
+    if not path.is_absolute():
+        path = (_ROOT / path).resolve()
+
+    if not path.is_file():
+        raise SystemExit(
+            f"Capture file not found:\n  {path}\n\n"
+            "Record one first:\n"
+            "  python tools/capture_csi.py\n"
+            "(ESP CSI nodes must be broadcasting, or you will get 0 packets.)"
+        )
+
+    rows = load_rows(path)
     if not rows:
-        raise SystemExit("no rows")
+        raise SystemExit(f"No valid rows in {path}")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     delay = 1.0 / max(1.0, a.rate)
-    print(f"[replay] {len(rows)} rows → {a.host}:{a.port} @ {a.rate} Hz")
+    print(f"[replay] {len(rows)} rows from {path}")
+    print(f"[replay] → {a.host}:{a.port} @ {a.rate} Hz")
 
     try:
         while True:
