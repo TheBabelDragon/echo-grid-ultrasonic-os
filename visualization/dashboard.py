@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Echo Grid live stack — actuator |offset| map (no grey dead-zone)."""
+"""
+Echo Grid live stack — CSI enabled by default
+
+  python visualization/dashboard.py
+  python visualization/dashboard.py --body          # + ultrasonic body
+  python visualization/dashboard.py --no-csi        # software field only (no RF)
+"""
 
 from __future__ import annotations
 
@@ -36,10 +42,7 @@ TRACK_COLORS = ["#ff4d6d", "#4cc9f0", "#f4a261", "#a0e8af", "#c77dff", "#ffe066"
 
 
 class LiveDashboard:
-    def __init__(self, size=16, body_port=None, csi_port=None, drive=False, closed_loop=True):
-        if csi_port is None and body_port is None:
-            raise SystemExit("Need --csi and/or --body")
-
+    def __init__(self, size=16, body_port=None, csi_port=4210, drive=False, closed_loop=True):
         self.osys = EchoGridOS(size=size, body_port=body_port, csi_port=csi_port)
         self.drive = drive
         self.closed_loop = closed_loop
@@ -86,7 +89,6 @@ class LiveDashboard:
             bbox=dict(boxstyle="round,pad=0.25", facecolor="#222", alpha=0.75),
         )
 
-        # Actuator panel: |Hz offset| with inferno — never coolwarm-grey
         self.im_df = self.ax_df.imshow(
             z.copy(), cmap="inferno", vmin=0, vmax=400, origin="lower", extent=[0, 1, 0, 1],
         )
@@ -116,12 +118,16 @@ class LiveDashboard:
             bits.append("body")
         if self.osys.csi_enabled:
             bits.append("csi")
-        self.fig.suptitle(f"Echo Grid  ·  live  ·  {'+'.join(bits)}", fontsize=13)
+        if not bits:
+            bits.append("idle")
+        self.fig.suptitle(f"Echo Grid  ·  {'+'.join(bits)}", fontsize=13)
         self.status = self.fig.text(0.5, 0.01, "", ha="center", fontsize=9, family="monospace")
         self.fig.canvas.mpl_connect("close_event", lambda e: setattr(self, "_running", False))
 
     def _sub_bars(self):
-        pkt = self.osys.csi.last_packet if self.osys.csi else None
+        if not self.osys.csi:
+            return np.zeros(16)
+        pkt = self.osys.csi.last_packet
         if not pkt:
             return np.zeros(16)
         try:
@@ -177,7 +183,6 @@ class LiveDashboard:
             f"tracks {len(tracks)}   rssi {self.osys.csi.last_rssi if self.osys.csi else 0:.0f}"
         )
 
-        # |delta-f| map — inferno is black→yellow, never mid-grey flood
         df_abs = np.array(self.osys.mapper.delta_f_abs(phi_view), dtype=np.float32, copy=True)
         self.im_df.set_data(df_abs)
         df_max = float(df_abs.max())
@@ -188,7 +193,6 @@ class LiveDashboard:
             self._df_clim = 0.55 * self._df_clim + 0.45 * target
         else:
             self._df_clim = 0.90 * self._df_clim + 0.10 * target
-        # hard floor so empty field is dark, not washed grey
         self.im_df.set_clim(0.0, max(120.0, self._df_clim))
         self.df_readout.set_text(
             f"|Δf| max {df_max:.0f} Hz   mean {df_mean:.0f}\n"
@@ -213,14 +217,14 @@ class LiveDashboard:
         if now - self._last_log > 1.0:
             self._last_log = now
             print(
-                f"[live] |Δf|_max={df_max:.1f}  scale={self._df_clim:.0f}  "
-                f"drive={self.osys.field._drive:.2f}  motion={e:.3f}  tracks={len(tracks)}"
+                f"[live] |Δf|_max={df_max:.1f}  drive={self.osys.field._drive:.2f}  "
+                f"motion={e:.3f}  tracks={len(tracks)}  pkts={self.osys.csi_packets}"
             )
 
     def run(self):
         if _BACKEND == "Agg":
             print("No GUI backend"); self.osys.close(); return
-        print(f"[dashboard] backend={_BACKEND}")
+        print(f"[dashboard] backend={_BACKEND}  csi={'on' if self.osys.csi_enabled else 'off'}")
         plt.show(block=False)
         self.fig.canvas.draw()
         try:
@@ -243,14 +247,19 @@ class LiveDashboard:
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--body", nargs="?", const="", default=None)
-    p.add_argument("--csi", nargs="?", const=4210, type=int, default=None)
-    p.add_argument("--drive", action="store_true")
-    p.add_argument("--no-loop", action="store_true")
+    p = argparse.ArgumentParser(description="Echo Grid live dashboard (CSI default on)")
+    p.add_argument("--body", nargs="?", const="", default=None,
+                   help="attach ultrasonic body serial (optional port)")
+    p.add_argument("--csi", nargs="?", const=4210, type=int, default=4210,
+                   help="CSI UDP port (default 4210)")
+    p.add_argument("--no-csi", action="store_true", help="disable CSI input")
+    p.add_argument("--drive", action="store_true", help="drive body emitters from field")
+    p.add_argument("--no-loop", action="store_true", help="disable closed-loop feedback")
     p.add_argument("--size", type=int, default=16)
     a = p.parse_args()
-    LiveDashboard(a.size, a.body, a.csi, a.drive, not a.no_loop).run()
+
+    csi_port = None if a.no_csi else a.csi
+    LiveDashboard(a.size, a.body, csi_port, a.drive, not a.no_loop).run()
 
 
 if __name__ == "__main__":
