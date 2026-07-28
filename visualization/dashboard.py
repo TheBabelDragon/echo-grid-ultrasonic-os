@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Echo Grid live view — real CSI/body only (no synthetic demo)
+Echo Grid live view — three panels, each with a clear job
+
+  Left   Phase φ     computational wavefield + track circles
+  Middle Δf map      ultrasonic actuator encoding (40kHz + k·φ)
+  Right  CSI         real motion / subcarriers / packet stats
 
   python visualization/dashboard.py --csi
 """
@@ -9,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -44,24 +47,25 @@ STATE_LS = {"idle": ":", "move": "-", "surge": "-"}
 class LiveDashboard:
     def __init__(self, size=16, body_port=None, csi_port=None, drive=False, closed_loop=True):
         if csi_port is None and body_port is None:
-            raise SystemExit("Need --csi and/or --body (real inputs only)")
+            raise SystemExit("Need --csi and/or --body")
 
         self.osys = EchoGridOS(size=size, body_port=body_port, csi_port=csi_port)
         self.drive = drive
         self.closed_loop = closed_loop
         self.size = size
 
-        self.fig = plt.figure(figsize=(13, 5.5))
-        gs = self.fig.add_gridspec(1, 3, width_ratios=[1.1, 1.1, 0.7], wspace=0.28)
+        self.fig = plt.figure(figsize=(13.5, 5.8))
+        gs = self.fig.add_gridspec(1, 3, width_ratios=[1.15, 1.15, 0.75], wspace=0.3)
         self.ax_phi = self.fig.add_subplot(gs[0, 0])
         self.ax_freq = self.fig.add_subplot(gs[0, 1])
         self.ax_csi = self.fig.add_subplot(gs[0, 2])
 
+        # --- Phase: computational field ---
         self.im_phi = self.ax_phi.imshow(
-            np.zeros((size, size)), cmap="viridis", vmin=-2, vmax=2,
+            np.zeros((size, size)), cmap="viridis", vmin=-1, vmax=1,
             animated=True, origin="lower", extent=[0, 1, 0, 1],
         )
-        self.ax_phi.set_title("Phase φ + real tracks")
+        self.ax_phi.set_title("Phase field φ\n(wavefield state)", fontsize=11)
         self.fig.colorbar(self.im_phi, ax=self.ax_phi, fraction=0.046, pad=0.04)
 
         self.track_rings, self.track_dots, self.track_labels = [], [], []
@@ -75,30 +79,46 @@ class LiveDashboard:
             self.track_dots.append(dot)
             self.track_labels.append(lab)
 
+        # --- Δf: actuator frequency offset map ---
         self.im_freq = self.ax_freq.imshow(
-            np.zeros((size, size)), cmap="coolwarm", vmin=-1500, vmax=1500,
+            np.zeros((size, size)), cmap="coolwarm", vmin=-500, vmax=500,
             animated=True, origin="lower", extent=[0, 1, 0, 1],
         )
-        self.ax_freq.set_title("Frequency Δf (Hz from 40 kHz)")
-        self.fig.colorbar(self.im_freq, ax=self.ax_freq, fraction=0.046, pad=0.04)
+        self.ax_freq.set_title("Actuator Δf map\n(f = 40 kHz + k·φ)", fontsize=11)
+        self.cbar_freq = self.fig.colorbar(self.im_freq, ax=self.ax_freq, fraction=0.046, pad=0.04)
+        self.cbar_freq.set_label("Hz from 40 kHz")
+        self.freq_readout = self.ax_freq.text(
+            0.02, 0.98, "Δf max —", transform=self.ax_freq.transAxes,
+            ha="left", va="top", fontsize=9, family="monospace",
+            color="white", bbox=dict(boxstyle="round,pad=0.25", facecolor="#222", alpha=0.7),
+        )
 
-        self.ax_csi.set_title("CSI (real)")
+        # --- CSI observation ---
+        self.ax_csi.set_title("CSI observation\n(real RF motion)", fontsize=11)
         self.ax_csi.set_xlim(0, 1)
         self.ax_csi.set_ylim(0, 1)
         self.ax_csi.axis("off")
-        self.ax_csi.add_patch(FancyBboxPatch((0.12, 0.72), 0.76, 0.12, boxstyle="round,pad=0.01,rounding_size=0.02",
-                                             facecolor="#1a1a2e", edgecolor="#444"))
-        self.energy_bar = FancyBboxPatch((0.12, 0.72), 0.02, 0.12, boxstyle="round,pad=0.01,rounding_size=0.02",
-                                         facecolor="#00d4aa", edgecolor="none")
+        self.ax_csi.add_patch(FancyBboxPatch(
+            (0.12, 0.72), 0.76, 0.12, boxstyle="round,pad=0.01,rounding_size=0.02",
+            facecolor="#1a1a2e", edgecolor="#444",
+        ))
+        self.energy_bar = FancyBboxPatch(
+            (0.12, 0.72), 0.02, 0.12, boxstyle="round,pad=0.01,rounding_size=0.02",
+            facecolor="#00d4aa", edgecolor="none",
+        )
         self.ax_csi.add_patch(self.energy_bar)
-        self.energy_label = self.ax_csi.text(0.5, 0.88, "motion  0.00", ha="center", va="bottom",
-                                             fontsize=11, family="monospace", color="#ddd")
+        self.energy_label = self.ax_csi.text(
+            0.5, 0.88, "motion  0.00", ha="center", va="bottom",
+            fontsize=11, family="monospace", color="#ddd",
+        )
         self.rssi_text = self.ax_csi.text(0.5, 0.62, "rssi  —", ha="center", fontsize=10, family="monospace", color="#aaa")
         self.pkts_text = self.ax_csi.text(0.5, 0.54, "pkts  0", ha="center", fontsize=10, family="monospace", color="#aaa")
         self.tracks_text = self.ax_csi.text(0.5, 0.46, "tracks  0", ha="center", fontsize=10, family="monospace", color="#aaa")
         self.n_bars = 16
-        self.bars = self.ax_csi.bar(np.linspace(0.12, 0.88, self.n_bars), np.zeros(self.n_bars),
-                                    width=0.04, bottom=0.10, color="#4cc9f0", align="center")
+        self.bars = self.ax_csi.bar(
+            np.linspace(0.12, 0.88, self.n_bars), np.zeros(self.n_bars),
+            width=0.04, bottom=0.10, color="#4cc9f0", align="center",
+        )
         self.ax_csi.text(0.5, 0.04, "subcarriers", ha="center", fontsize=9, color="#888")
 
         bits = []
@@ -106,8 +126,11 @@ class LiveDashboard:
             bits.append("body")
         if self.osys.csi_enabled:
             bits.append("csi")
-        self.fig.suptitle(f"Echo Grid  ·  real-only  ·  {'+'.join(bits) or 'waiting'}", fontsize=12)
-        self.status = self.fig.text(0.5, 0.01, "", ha="center", fontsize=9, family="monospace")
+        self.fig.suptitle(
+            f"Echo Grid  ·  real-only  ·  {'+'.join(bits) or 'waiting'}",
+            fontsize=12,
+        )
+        self.status = self.fig.text(0.5, 0.012, "", ha="center", fontsize=9, family="monospace")
         self._ani = None
 
     def _bars(self):
@@ -126,16 +149,24 @@ class LiveDashboard:
     def update(self, _frame):
         phi = self.osys.step(drive_body=self.drive, closed_loop=self.closed_loop)
 
+        # Phase — percentile scale so weak real fields still show shape
         self.im_phi.set_array(phi)
-        pmax = float(np.max(np.abs(phi))) + 1e-6
-        clim = max(0.25, min(2.0, pmax * 1.2))
-        self.im_phi.set_clim(-clim, clim)
+        lo, hi = np.percentile(phi, [5, 95])
+        span = max(0.15, float(hi - lo) * 0.5 + 1e-6)
+        mid = float(phi.mean())
+        self.im_phi.set_clim(mid - span * 2.2, mid + span * 2.2)
 
-        df = phi * 2000.0
+        # Δf actuator map — THIS is the ultrasonic encoding of the field
+        df = self.osys.mapper.delta_f(phi)
         self.im_freq.set_array(df)
-        fmax = float(np.max(np.abs(df))) + 1.0
-        fclim = max(150.0, min(2000.0, fmax * 1.25))
+        abs_df = np.abs(df)
+        p95 = float(np.percentile(abs_df, 95))
+        fclim = max(80.0, min(2500.0, p95 * 1.8 + 40.0))
         self.im_freq.set_clim(-fclim, fclim)
+        self.freq_readout.set_text(
+            f"Δf max {float(abs_df.max()):.0f} Hz\n"
+            f"scale ±{fclim:.0f} Hz"
+        )
 
         e = float(self.osys.last_csi_energy)
         self.energy_bar.set_width(max(0.02, 0.76 * e))
@@ -165,22 +196,29 @@ class LiveDashboard:
                 lab.set_text(f"{tr.track_id} {tr.state}\n{tr.confidence:.2f}")
                 lab.set_alpha(a)
             else:
-                ring.set_alpha(0); dot.set_alpha(0); lab.set_alpha(0)
+                ring.set_alpha(0)
+                dot.set_alpha(0)
+                lab.set_alpha(0)
 
         for rect, h in zip(self.bars, self._bars()):
             rect.set_height(0.28 * h)
 
         self.status.set_text(
             f"entropy={self.osys.field.entropy:.3f}  motion={e:.3f}  "
-            f"tracks={len(tracks)}  Δf=±{fclim:.0f}Hz  pkts={self.osys.csi_packets}  t={self.osys.t:.1f}s"
+            f"tracks={len(tracks)}  Δf_max={float(abs_df.max()):.0f}Hz  "
+            f"pkts={self.osys.csi_packets}  t={self.osys.t:.1f}s"
         )
         return []
 
     def run(self):
         if _BACKEND == "Agg":
-            print("No GUI backend"); self.osys.close(); return
-        self._ani = FuncAnimation(self.fig, self.update, interval=40, blit=False, cache_frame_data=False)
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            print("No GUI backend")
+            self.osys.close()
+            return
+        self._ani = FuncAnimation(
+            self.fig, self.update, interval=40, blit=False, cache_frame_data=False,
+        )
+        plt.tight_layout(rect=[0, 0.03, 1, 0.93])
         try:
             plt.show()
         finally:
@@ -196,7 +234,8 @@ def main():
     p.add_argument("--no-loop", action="store_true")
     p.add_argument("--size", type=int, default=16)
     a = p.parse_args()
-    print(f"[dashboard] real-only  backend={_BACKEND}  csi={a.csi}")
+    print(f"[dashboard] real-only  backend={_BACKEND}")
+    print("  left=φ wavefield   middle=actuator Δf   right=CSI motion")
     LiveDashboard(a.size, a.body, a.csi, a.drive, not a.no_loop).run()
 
 

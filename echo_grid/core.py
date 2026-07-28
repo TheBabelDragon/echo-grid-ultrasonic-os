@@ -1,4 +1,4 @@
-"""Echo Grid — real inputs only (CSI / body)."""
+"""Echo Grid — real CSI/body drive the field hard enough to see Δf."""
 
 from __future__ import annotations
 
@@ -15,20 +15,20 @@ class EchoFieldOS:
         self.size = size
         self.phi = np.zeros((size, size), dtype=np.float32)
         self.vel = np.zeros((size, size), dtype=np.float32)
-        self.lmbda = 0.08
-        self.gamma = 0.93
+        self.lmbda = 0.10
+        self.gamma = 0.94
         self.entropy = 0.0
         self.max_abs = 4.0
 
     def inject(self, x: float, y: float, force: float = 1.0):
         ix = int(np.clip(x * self.size, 0, self.size - 1))
         iy = int(np.clip(y * self.size, 0, self.size - 1))
-        force = float(np.clip(force, -2.0, 2.0))
+        force = float(np.clip(force, -3.0, 3.0))
         for j in range(self.size):
             for i in range(self.size):
                 dx, dy = i - ix, j - iy
                 d2 = dx * dx + dy * dy + 1e-6
-                self.vel[j, i] += np.exp(-d2 * 0.15) * force
+                self.vel[j, i] += np.exp(-d2 * 0.12) * force
 
     def step(self) -> np.ndarray:
         lap = (
@@ -45,9 +45,14 @@ class EchoFieldOS:
 
 
 class UltrasonicMapper:
+    """Field → actuator encoding: f = 40000 + k·φ, amp = |φ|."""
+
     def __init__(self, base_freq: int = 40000, k: float = 2000.0):
         self.base_freq = base_freq
         self.k = k
+
+    def delta_f(self, field: np.ndarray) -> np.ndarray:
+        return field * self.k
 
     def region_energies(self, field: np.ndarray, n_emitters: int = 4) -> List[float]:
         h, w = field.shape
@@ -80,7 +85,6 @@ class EchoGridOS:
                 self.body = FieldBodyClient(port=body_port if body_port else None)
                 self.body.connect()
                 self.body_connected = True
-                print("[EchoGridOS] body attached")
             except Exception as e:
                 print(f"[EchoGridOS] body unavailable ({e})")
 
@@ -93,21 +97,24 @@ class EchoGridOS:
                 print(f"[EchoGridOS] CSI unavailable ({e})")
 
     def touch(self, x: float, y: float, strength: float = 1.0):
-        """Manual / external real inject only — not used by a fake demo loop."""
         self.field.inject(x, y, strength)
 
     def step(self, drive_body: bool = False, closed_loop: bool = True) -> np.ndarray:
-        # Real CSI only
         if self.csi is not None:
             self.csi.poll()
             self.last_csi_energy = self.csi.last_energy
             self.csi_packets = self.csi.packet_count
-            for tr in self.csi.active_tracks():
-                if tr.energy > 0.05 and tr.confidence > 0.28:
-                    x, y = tr.pos
-                    self.field.inject(x, y, force=tr.energy * tr.confidence * 0.9)
+            tracks = self.csi.active_tracks()
+            if tracks:
+                for tr in tracks:
+                    if tr.energy > 0.04:
+                        x, y = tr.pos
+                        # stronger real inject so φ and Δf actually develop
+                        self.field.inject(x, y, force=1.1 * tr.energy * max(0.35, tr.confidence))
+            elif self.last_csi_energy > 0.08:
+                # motion without stable track still drives center mass
+                self.field.inject(0.5, 0.5, force=0.7 * self.last_csi_energy)
 
-        # Real ultrasonic body only
         if closed_loop and self.body is not None:
             obs = self.body.poll_observation()
             if obs is not None:
@@ -116,7 +123,7 @@ class EchoGridOS:
                     val = float(regions[0].get("observed", 0.0))
                     self.last_obs = val
                     if val > 0.01:
-                        self.field.inject(0.5, 0.5, force=val * 0.3)
+                        self.field.inject(0.5, 0.5, force=val * 0.35)
 
         phi = self.field.step()
 
@@ -134,16 +141,11 @@ class EchoGridOS:
         if now - self._status_t >= 1.2:
             self._status_t = now
             ntr = len(self.csi.active_tracks()) if self.csi else 0
-            modes = []
-            if self.body_connected:
-                modes.append("body")
-            if self.csi_enabled:
-                modes.append("csi")
-            if not modes:
-                modes.append("idle")
+            df = self.mapper.delta_f(phi)
             print(
-                f"[field] mode={'+'.join(modes)}  entropy={self.field.entropy:.3f}  "
-                f"csi={self.last_csi_energy:.3f}  tracks={ntr}  pkts={self.csi_packets}  t={self.t:.1f}s"
+                f"[field] entropy={self.field.entropy:.3f}  motion={self.last_csi_energy:.3f}  "
+                f"tracks={ntr}  Δf_max={float(np.max(np.abs(df))):.0f}Hz  "
+                f"pkts={self.csi_packets}  t={self.t:.1f}s"
             )
         return phi
 
