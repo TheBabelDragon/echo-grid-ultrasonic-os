@@ -1,16 +1,15 @@
 """
-Multi-body CSI track layer for Echo Grid.
+Multi-body CSI tracks — improved spatial intelligence.
 
-Practical scope (v1):
-  - One track per CSI node_id (multi-ESP)
-  - Extra local peaks from a single node's subcarrier profile
-  - Smoothed (x, y, energy) for display circles + field injection
-
-Not yet: full ML person re-ID / through-wall identity.
+- Prominence-based subcarrier peak detection
+- Constant-velocity smoothing
+- Confidence from stability + evidence
+- Greedy association to reduce ID flicker
 """
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,24 +20,72 @@ class Track:
     track_id: str
     x: float = 0.5
     y: float = 0.5
+    vx: float = 0.0
+    vy: float = 0.0
     energy: float = 0.0
+    confidence: float = 0.3
     rssi: float = -90.0
     last_seen: float = field(default_factory=time.time)
     hits: int = 0
 
-    def smooth_toward(self, x: float, y: float, energy: float, alpha: float = 0.35):
+    def predict(self, dt: float):
+        self.x = min(1.0, max(0.0, self.x + self.vx * dt))
+        self.y = min(1.0, max(0.0, self.y + self.vy * dt))
+
+    def update(self, x: float, y: float, energy: float, alpha: float = 0.4):
+        now = time.time()
+        dt = max(1e-3, now - self.last_seen)
+        # measured residual
+        mx, my = x - self.x, y - self.y
+        # velocity estimate
+        self.vx = (1 - alpha) * self.vx + alpha * (mx / dt)
+        self.vy = (1 - alpha) * self.vy + alpha * (my / dt)
+        # clamp speed (normalized field units / sec)
+        speed = math.hypot(self.vx, self.vy)
+        if speed > 1.5:
+            self.vx *= 1.5 / speed
+            self.vy *= 1.5 / speed
         self.x = (1 - alpha) * self.x + alpha * x
         self.y = (1 - alpha) * self.y + alpha * y
         self.energy = (1 - alpha) * self.energy + alpha * energy
-        self.last_seen = time.time()
         self.hits += 1
+        self.last_seen = now
+        # confidence rises with hits and energy, falls with jittery motion
+        stab = 1.0 / (1.0 + speed)
+        self.confidence = min(0.98, 0.25 + 0.08 * min(self.hits, 8) + 0.4 * self.energy * stab)
+
+
+def _find_peaks(vals: List[float], max_peaks: int = 3) -> List[Tuple[int, float]]:
+    """Return (index, prominence) peaks."""
+    n = len(vals)
+    if n < 5:
+        return []
+    peaks = []
+    for i in range(1, n - 1):
+        if vals[i] >= vals[i - 1] and vals[i] >= vals[i + 1]:
+            left = vals[i]
+            for j in range(i - 1, -1, -1):
+                left = min(left, vals[j])
+                if vals[j] > vals[i]:
+                    break
+            right = vals[i]
+            for j in range(i + 1, n):
+                right = min(right, vals[j])
+                if vals[j] > vals[i]:
+                    break
+            prom = vals[i] - max(left, right)
+            if prom > 0.04 and vals[i] > 0.12:
+                peaks.append((i, prom * vals[i]))
+    peaks.sort(key=lambda t: t[1], reverse=True)
+    return peaks[:max_peaks]
 
 
 class TrackStore:
-    def __init__(self, max_tracks: int = 6, ttl_s: float = 3.0):
+    def __init__(self, max_tracks: int = 6, ttl_s: float = 2.5):
         self.max_tracks = max_tracks
         self.ttl_s = ttl_s
         self.tracks: Dict[str, Track] = {}
+        self._last_update = time.time()
 
     def _energy(self, pkt: Dict[str, Any]) -> float:
         for key in ("movement_intensity", "activity"):
@@ -56,92 +103,108 @@ class TrackStore:
             return 0.0
         return float(min(1.0, sum(vals) / len(vals)))
 
-    def _position_from_csi(self, pkt: Dict[str, Any], energy: float) -> Tuple[float, float]:
+    def _detections(self, pkt: Dict[str, Any]) -> List[Tuple[str, float, float, float]]:
+        """List of (suggested_id, x, y, energy)."""
+        node = str(pkt.get("node") or "csi")
+        energy = self._energy(pkt)
         csi = pkt.get("csi") or []
         try:
             vals = [float(v) for v in csi]
         except (TypeError, ValueError):
             vals = []
 
-        if len(vals) >= 8:
+        dets: List[Tuple[str, float, float, float]] = []
+
+        # Always one whole-node detection
+        if len(vals) >= 4:
             mid = len(vals) // 2
-            left = sum(vals[:mid]) / mid
+            left = sum(vals[:mid]) / max(1, mid)
             right = sum(vals[mid:]) / max(1, len(vals) - mid)
             total = left + right + 1e-6
-            x = 0.25 + 0.50 * (right / total)
-            y = 0.30 + 0.40 * energy
+            x = 0.22 + 0.56 * (right / total)
+            y = 0.28 + 0.45 * energy
         else:
-            x, y = 0.5, 0.5
-        return (x, y)
+            x, y = 0.5, 0.45
+        dets.append((node, x, y, energy))
 
-    def _peak_tracks(self, pkt: Dict[str, Any], node: str) -> List[Tuple[str, float, float, float]]:
-        """Split a single CSI vector into up to 2 spatial peaks."""
-        csi = pkt.get("csi") or []
-        try:
-            vals = [float(v) for v in csi]
-        except (TypeError, ValueError):
-            return []
+        # Peak-based extra bodies
+        if len(vals) >= 12 and energy > 0.15:
+            peaks = _find_peaks(vals, max_peaks=3)
+            for rank, (idx, score) in enumerate(peaks):
+                e = float(min(1.0, vals[idx]))
+                if e < 0.15:
+                    continue
+                px = 0.15 + 0.70 * (idx / max(1, len(vals) - 1))
+                py = 0.25 + 0.50 * e
+                dets.append((f"{node}:p{rank}", px, py, e))
 
-        if len(vals) < 12:
-            return []
-
-        n = len(vals)
-        third = n // 3
-        regions = [
-            ("L", vals[:third], 0.25),
-            ("C", vals[third:2 * third], 0.50),
-            ("R", vals[2 * third:], 0.75),
-        ]
-        scored = []
-        for name, chunk, x in regions:
-            if not chunk:
-                continue
-            e = sum(chunk) / len(chunk)
-            scored.append((name, x, e))
-        scored.sort(key=lambda t: t[2], reverse=True)
-
-        out = []
-        for name, x, e in scored[:2]:
-            if e < 0.12:
-                continue
-            y = 0.35 + 0.35 * min(1.0, e)
-            out.append((f"{node}:{name}", x, y, float(min(1.0, e))))
-        return out
+        return dets
 
     def update_from_packet(self, pkt: Dict[str, Any]) -> None:
-        node = str(pkt.get("node") or pkt.get("body_id") or "csi_unknown")
-        energy = self._energy(pkt)
+        now = time.time()
+        dt = max(1e-3, now - self._last_update)
+        self._last_update = now
+
+        for tr in self.tracks.values():
+            tr.predict(dt)
+
+        dets = self._detections(pkt)
         try:
             rssi = float(pkt.get("rssi", -90))
         except (TypeError, ValueError):
             rssi = -90.0
 
-        # Primary track = whole node
-        x, y = self._position_from_csi(pkt, energy)
-        tid = node
-        if tid not in self.tracks:
-            if len(self.tracks) >= self.max_tracks:
-                self._drop_oldest()
-            self.tracks[tid] = Track(track_id=tid, x=x, y=y, energy=energy, rssi=rssi)
-        self.tracks[tid].smooth_toward(x, y, energy)
-        self.tracks[tid].rssi = rssi
+        unmatched_dets = list(range(len(dets)))
+        unmatched_tracks = list(self.tracks.keys())
 
-        # Optional local peaks as extra circles when energy is rich
-        if energy > 0.25:
-            for pid, px, py, pe in self._peak_tracks(pkt, node):
-                if pid not in self.tracks:
-                    if len(self.tracks) >= self.max_tracks:
-                        break
-                    self.tracks[pid] = Track(track_id=pid, x=px, y=py, energy=pe, rssi=rssi)
-                self.tracks[pid].smooth_toward(px, py, pe)
+        # Greedy nearest association in (x,y)
+        pairs = []
+        for ti, tid in enumerate(unmatched_tracks):
+            tr = self.tracks[tid]
+            for di in unmatched_dets:
+                _, x, y, e = dets[di]
+                dist = math.hypot(tr.x - x, tr.y - y)
+                if dist < 0.28:
+                    pairs.append((dist, tid, di))
+        pairs.sort()
+        used_t, used_d = set(), set()
+        for dist, tid, di in pairs:
+            if tid in used_t or di in used_d:
+                continue
+            _, x, y, e = dets[di]
+            self.tracks[tid].update(x, y, e)
+            self.tracks[tid].rssi = rssi
+            used_t.add(tid)
+            used_d.add(di)
+
+        # New tracks for unmatched detections
+        for di, det in enumerate(dets):
+            if di in used_d:
+                continue
+            sid, x, y, e = det
+            if e < 0.08:
+                continue
+            # Prefer stable id; if collision, unique suffix
+            tid = sid
+            if tid in self.tracks and tid not in used_t:
+                # existing track far away — new id
+                tid = f"{sid}_{int(now * 10) % 1000}"
+            if tid not in self.tracks:
+                if len(self.tracks) >= self.max_tracks:
+                    self._drop_weakest()
+                if len(self.tracks) >= self.max_tracks:
+                    continue
+                self.tracks[tid] = Track(track_id=tid, x=x, y=y, energy=e, rssi=rssi)
+            self.tracks[tid].update(x, y, e)
+            self.tracks[tid].rssi = rssi
 
         self._expire()
 
-    def _drop_oldest(self):
+    def _drop_weakest(self):
         if not self.tracks:
             return
-        oldest = min(self.tracks.values(), key=lambda t: t.last_seen)
-        del self.tracks[oldest.track_id]
+        weak = min(self.tracks.values(), key=lambda t: (t.confidence, t.energy, t.hits))
+        del self.tracks[weak.track_id]
 
     def _expire(self):
         now = time.time()
@@ -151,4 +214,6 @@ class TrackStore:
 
     def active(self) -> List[Track]:
         self._expire()
-        return sorted(self.tracks.values(), key=lambda t: t.energy, reverse=True)
+        # require minimal confidence for display
+        out = [t for t in self.tracks.values() if t.confidence > 0.28 or t.hits >= 2]
+        return sorted(out, key=lambda t: t.energy * t.confidence, reverse=True)

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Echo Grid live visualization — multi-body CSI tracking circles
+Echo Grid live visualization — adaptive frequency map + multi-track circles
 
-  python visualization/dashboard.py --csi
+  python visualization/dashboard.py --csi --no-demo
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ from matplotlib.patches import Circle, FancyBboxPatch
 from echo_grid.core import EchoGridOS
 
 TRACK_COLORS = ["#ff4d6d", "#4cc9f0", "#f4a261", "#a0e8af", "#c77dff", "#ffe066"]
+BASE_FREQ = 40000.0
 
 
 class LiveDashboard:
@@ -68,34 +69,32 @@ class LiveDashboard:
             extent=[0, 1, 0, 1],
         )
         self.ax_phi.set_title("Phase field φ + tracks")
-        self.ax_phi.set_xlabel("x")
-        self.ax_phi.set_ylabel("y")
         self.fig.colorbar(self.im_phi, ax=self.ax_phi, fraction=0.046, pad=0.04)
 
-        # Pre-allocate tracking circles + labels
-        self.track_rings = []
-        self.track_dots = []
-        self.track_labels = []
-        for i, color in enumerate(TRACK_COLORS):
+        self.track_rings, self.track_dots, self.track_labels = [], [], []
+        for color in TRACK_COLORS:
             ring = Circle((0.5, 0.5), 0.06, fill=False, edgecolor=color,
                           linewidth=2.2, alpha=0.0, zorder=6)
             dot, = self.ax_phi.plot([0.5], [0.5], "o", color=color, markersize=9,
                                     markeredgecolor="white", markeredgewidth=1.0,
                                     alpha=0.0, zorder=7)
-            lab = self.ax_phi.text(0.5, 0.5, "", color=color, fontsize=8,
+            lab = self.ax_phi.text(0.5, 0.5, "", color=color, fontsize=7,
                                    ha="left", va="bottom", alpha=0.0, zorder=8)
             self.ax_phi.add_patch(ring)
             self.track_rings.append(ring)
             self.track_dots.append(dot)
             self.track_labels.append(lab)
 
+        # Frequency shown as Δf from 40 kHz so structure is visible
         self.im_freq = self.ax_freq.imshow(
-            np.zeros((size, size)), cmap="plasma",
-            vmin=38000, vmax=42000, animated=True, origin="lower",
+            np.zeros((size, size)), cmap="coolwarm",
+            vmin=-1500, vmax=1500, animated=True, origin="lower",
             extent=[0, 1, 0, 1],
         )
-        self.ax_freq.set_title("Frequency map (Hz)")
-        self.fig.colorbar(self.im_freq, ax=self.ax_freq, fraction=0.046, pad=0.04)
+        self.ax_freq.set_title("Frequency Δf (Hz from 40 kHz)")
+        self.cbar_freq = self.fig.colorbar(
+            self.im_freq, ax=self.ax_freq, fraction=0.046, pad=0.04
+        )
 
         # CSI panel
         self.ax_csi.set_title("CSI observation")
@@ -179,9 +178,20 @@ class LiveDashboard:
             )
 
         phi = self.osys.step(drive_body=self.drive, closed_loop=self.closed_loop)
-        freq = 40000.0 + phi * 2000.0
+
+        # Phase
         self.im_phi.set_array(phi)
-        self.im_freq.set_array(freq)
+        # Adaptive phase scale so weak fields still show structure
+        pmax = float(np.max(np.abs(phi))) + 1e-6
+        clim = max(0.35, min(2.0, pmax * 1.15))
+        self.im_phi.set_clim(-clim, clim)
+
+        # Frequency as deviation from base — THIS is what was looking empty before
+        df = phi * 2000.0  # Hz offset from 40 kHz
+        self.im_freq.set_array(df)
+        fmax = float(np.max(np.abs(df))) + 1.0
+        fclim = max(200.0, min(2000.0, fmax * 1.2))
+        self.im_freq.set_clim(-fclim, fclim)
 
         e = float(self.osys.last_csi_energy)
         self.energy_bar.set_width(max(0.02, 0.76 * e))
@@ -197,23 +207,23 @@ class LiveDashboard:
         tracks = self.osys.csi.active_tracks() if self.osys.csi else []
         self.tracks_text.set_text(f"tracks  {len(tracks)}")
 
-        # Update tracking circles
         for i in range(len(TRACK_COLORS)):
             ring = self.track_rings[i]
             dot = self.track_dots[i]
             lab = self.track_labels[i]
             if i < len(tracks):
                 tr = tracks[i]
-                alpha = min(1.0, 0.35 + tr.energy * 0.9)
-                radius = 0.04 + 0.10 * tr.energy
+                alpha = min(1.0, 0.3 + tr.confidence * 0.7)
+                radius = 0.035 + 0.11 * tr.energy
                 ring.center = (tr.x, tr.y)
                 ring.set_radius(radius)
                 ring.set_alpha(alpha)
+                ring.set_linewidth(1.5 + 2.0 * tr.confidence)
                 dot.set_data([tr.x], [tr.y])
                 dot.set_alpha(alpha)
-                short = tr.track_id if len(tr.track_id) <= 14 else tr.track_id[:12] + "…"
+                short = tr.track_id if len(tr.track_id) <= 12 else tr.track_id[:10] + "…"
                 lab.set_position((tr.x + 0.03, tr.y + 0.03))
-                lab.set_text(short)
+                lab.set_text(f"{short}\n{tr.confidence:.2f}")
                 lab.set_alpha(alpha)
             else:
                 ring.set_alpha(0.0)
@@ -226,7 +236,8 @@ class LiveDashboard:
         self.status.set_text(
             f"entropy={self.osys.field.entropy:.3f}   "
             f"csi={e:.3f}   tracks={len(tracks)}   "
-            f"pkts={self.osys.csi_packets}   t={self.osys.t:.1f}s"
+            f"Δf=±{fclim:.0f}Hz   pkts={self.osys.csi_packets}   "
+            f"t={self.osys.t:.1f}s"
         )
         return []
 
