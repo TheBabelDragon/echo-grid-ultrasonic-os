@@ -19,6 +19,22 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+# Pick an interactive backend before importing pyplot
+import matplotlib
+
+def _configure_backend() -> str:
+    for backend in ("TkAgg", "QtAgg", "Qt5Agg", "GTK4Agg", "GTK3Agg"):
+        try:
+            matplotlib.use(backend, force=True)
+            return backend
+        except Exception:
+            continue
+    # Last resort — will not show a window
+    matplotlib.use("Agg", force=True)
+    return "Agg"
+
+_BACKEND = _configure_backend()
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
@@ -68,6 +84,7 @@ class LiveDashboard:
         )
 
         self._t0 = time.time()
+        self._ani = None
 
     def _excite(self):
         t = time.time() - self._t0
@@ -92,7 +109,16 @@ class LiveDashboard:
         return [self.im_phi, self.im_freq, self.status]
 
     def run(self):
-        ani = FuncAnimation(
+        if _BACKEND == "Agg":
+            print("⚠️  No interactive GUI backend available.")
+            print("   On Arch install one of:")
+            print("     sudo pacman -S tk          # for TkAgg")
+            print("     # or pip install PyQt5     # for Qt5Agg")
+            print("   Then re-run this command.")
+            self.osys.close()
+            return
+
+        self._ani = FuncAnimation(
             self.fig,
             self.update,
             interval=40,
@@ -117,6 +143,8 @@ def main():
                         help="Disable closed-loop feedback")
     parser.add_argument("--size", type=int, default=16)
     args = parser.parse_args()
+
+    print(f"[dashboard] backend={_BACKEND}")
 
     dash = LiveDashboard(
         size=args.size,
