@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Echo Grid — live 2x2 stack (Tk-safe animation)
+Echo Grid — live 2x2 stack
+
+Uses a plain redraw loop (no FuncAnimation) to avoid Tk timer teardown bugs:
+  AttributeError: NoneType interval / remove_callback
 
   python visualization/dashboard.py --csi
 """
@@ -32,7 +35,6 @@ _BACKEND = _configure_backend()
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
 from matplotlib.patches import Circle
 
 from echo_grid.core import EchoGridOS
@@ -53,7 +55,6 @@ class LiveDashboard:
         self._last_df_max = -1.0
         self._last_log = 0.0
         self._running = True
-        self._ani: FuncAnimation | None = None
 
         self.fig = plt.figure(figsize=(12, 9))
         gs = self.fig.add_gridspec(2, 2, hspace=0.32, wspace=0.28)
@@ -67,7 +68,7 @@ class LiveDashboard:
 
         self.im_phi = self.ax_phi.imshow(
             z.copy(), cmap="viridis", vmin=-1, vmax=1, origin="lower",
-            extent=[0, 1, 0, 1], animated=True,
+            extent=[0, 1, 0, 1],
         )
         self.ax_phi.set_title("1 · Phase field φ + tracks", fontsize=11)
         self.fig.colorbar(self.im_phi, ax=self.ax_phi, fraction=0.046, pad=0.04)
@@ -85,7 +86,7 @@ class LiveDashboard:
 
         self.im_csi = self.ax_csi_sp.imshow(
             z.copy(), cmap="magma", vmin=0, vmax=1, origin="lower",
-            extent=[0, 1, 0, 1], animated=True,
+            extent=[0, 1, 0, 1],
         )
         self.ax_csi_sp.set_title("2 · CSI spatial map (RF residual)", fontsize=11)
         self.fig.colorbar(self.im_csi, ax=self.ax_csi_sp, fraction=0.046, pad=0.04)
@@ -97,7 +98,7 @@ class LiveDashboard:
 
         self.im_df = self.ax_df.imshow(
             z.copy(), cmap="coolwarm", vmin=-500, vmax=500, origin="lower",
-            extent=[0, 1, 0, 1], animated=True,
+            extent=[0, 1, 0, 1],
         )
         self.ax_df.set_title("3 · Actuator Δf  (dynamic)", fontsize=11)
         self.cbar_df = self.fig.colorbar(self.im_df, ax=self.ax_df, fraction=0.046, pad=0.04)
@@ -137,18 +138,6 @@ class LiveDashboard:
 
     def _on_close(self, _event=None):
         self._running = False
-        ani = self._ani
-        if ani is not None:
-            try:
-                if ani.event_source is not None:
-                    ani.event_source.stop()
-            except Exception:
-                pass
-            try:
-                ani._stop()  # type: ignore[attr-defined]
-            except Exception:
-                pass
-        self._ani = None
 
     def _sub_bars(self):
         pkt = self.osys.csi.last_packet if self.osys.csi else None
@@ -163,129 +152,120 @@ class LiveDashboard:
         idx = np.linspace(0, len(vals) - 1, 16)
         return np.clip(np.interp(idx, np.arange(len(vals)), vals), 0, 1)
 
-    def update(self, _frame):
-        if not self._running or self._ani is None:
-            return []
+    def tick(self):
+        if not self._running:
+            return
 
-        try:
-            self._frame += 1
-            phi = self.osys.step(drive_body=self.drive, closed_loop=self.closed_loop)
+        self._frame += 1
+        phi = self.osys.step(drive_body=self.drive, closed_loop=self.closed_loop)
 
-            phi_view = np.array(phi, dtype=np.float32, copy=True)
-            self.im_phi.set_data(phi_view)
-            lo, hi = np.percentile(phi_view, [5, 95])
-            span = max(0.12, float(hi - lo) * 0.55 + 1e-6)
-            mid = float(phi_view.mean())
-            self.im_phi.set_clim(mid - 2.5 * span, mid + 2.5 * span)
+        phi_view = np.array(phi, dtype=np.float32, copy=True)
+        self.im_phi.set_data(phi_view)
+        lo, hi = np.percentile(phi_view, [5, 95])
+        span = max(0.12, float(hi - lo) * 0.55 + 1e-6)
+        mid = float(phi_view.mean())
+        self.im_phi.set_clim(mid - 2.5 * span, mid + 2.5 * span)
 
-            tracks = self.osys.csi.active_tracks() if self.osys.csi else []
-            for i in range(len(TRACK_COLORS)):
-                ring, dot, lab = self.track_rings[i], self.track_dots[i], self.track_labels[i]
-                if i < len(tracks):
-                    tr = tracks[i]
-                    x, y = tr.pos
-                    a = min(1.0, 0.35 + tr.confidence * 0.65)
-                    ring.center = (x, y)
-                    ring.set_radius(0.03 + 0.12 * tr.energy)
-                    ring.set_alpha(a)
-                    ring.set_linewidth(1.5 + 2.0 * tr.confidence)
-                    dot.set_data([x], [y])
-                    dot.set_alpha(a)
-                    lab.set_position((x + 0.03, y + 0.03))
-                    lab.set_text(f"{tr.track_id} {tr.state}\n{tr.confidence:.2f}")
-                    lab.set_alpha(a)
-                else:
-                    ring.set_alpha(0)
-                    dot.set_alpha(0)
-                    lab.set_alpha(0)
-
-            if self.osys.csi is not None:
-                spatial = np.array(self.osys.csi.spatial_map(self.size), dtype=np.float32, copy=True)
+        tracks = self.osys.csi.active_tracks() if self.osys.csi else []
+        for i in range(len(TRACK_COLORS)):
+            ring, dot, lab = self.track_rings[i], self.track_dots[i], self.track_labels[i]
+            if i < len(tracks):
+                tr = tracks[i]
+                x, y = tr.pos
+                a = min(1.0, 0.35 + tr.confidence * 0.65)
+                ring.center = (x, y)
+                ring.set_radius(0.03 + 0.12 * tr.energy)
+                ring.set_alpha(a)
+                ring.set_linewidth(1.5 + 2.0 * tr.confidence)
+                dot.set_data([x], [y])
+                dot.set_alpha(a)
+                lab.set_position((x + 0.03, y + 0.03))
+                lab.set_text(f"{tr.track_id} {tr.state}\n{tr.confidence:.2f}")
+                lab.set_alpha(a)
             else:
-                spatial = np.zeros((self.size, self.size), dtype=np.float32)
-            self.im_csi.set_data(spatial)
-            smax = float(spatial.max()) + 1e-9
-            self.im_csi.set_clim(0.0, max(0.25, smax))
-            e = float(self.osys.last_csi_energy)
-            self.csi_readout.set_text(
-                f"motion {e:.2f}   pkts {self.osys.csi_packets}\n"
-                f"tracks {len(tracks)}   rssi {self.osys.csi.last_rssi if self.osys.csi else 0:.0f}"
-            )
+                ring.set_alpha(0)
+                dot.set_alpha(0)
+                lab.set_alpha(0)
 
-            df = np.array(self.osys.mapper.delta_f(phi_view), dtype=np.float32, copy=True)
-            self.im_df.set_data(df)
-            abs_df = np.abs(df)
-            df_max = float(abs_df.max())
-            df_mean = float(abs_df.mean())
-            p95 = float(np.percentile(abs_df, 95))
-            fclim = max(50.0, min(2500.0, max(p95 * 2.2, df_max * 1.15) + 25.0))
-            self.im_df.set_clim(-fclim, fclim)
-            self.df_readout.set_text(
-                f"Δf max {df_max:.0f} Hz   mean {df_mean:.0f}\n"
-                f"scale ±{fclim:.0f} Hz   frame {self._frame}"
-            )
+        if self.osys.csi is not None:
+            spatial = np.array(self.osys.csi.spatial_map(self.size), dtype=np.float32, copy=True)
+        else:
+            spatial = np.zeros((self.size, self.size), dtype=np.float32)
+        self.im_csi.set_data(spatial)
+        smax = float(spatial.max()) + 1e-9
+        self.im_csi.set_clim(0.0, max(0.25, smax))
+        e = float(self.osys.last_csi_energy)
+        self.csi_readout.set_text(
+            f"motion {e:.2f}   pkts {self.osys.csi_packets}\n"
+            f"tracks {len(tracks)}   rssi {self.osys.csi.last_rssi if self.osys.csi else 0:.0f}"
+        )
 
-            hist = self.osys.csi.motion_history if self.osys.csi else []
-            if hist:
-                ys = np.asarray(hist[-200:], dtype=float)
-                xs = np.arange(len(ys))
-                self.hist_line.set_data(xs, ys)
-                self.ax_hist.set_xlim(0, max(50, len(ys)))
-            for rect, h in zip(self.bars, self._sub_bars()):
-                rect.set_height(float(h))
+        df = np.array(self.osys.mapper.delta_f(phi_view), dtype=np.float32, copy=True)
+        self.im_df.set_data(df)
+        abs_df = np.abs(df)
+        df_max = float(abs_df.max())
+        df_mean = float(abs_df.mean())
+        p95 = float(np.percentile(abs_df, 95))
+        fclim = max(50.0, min(2500.0, max(p95 * 2.2, df_max * 1.15) + 25.0))
+        self.im_df.set_clim(-fclim, fclim)
+        self.df_readout.set_text(
+            f"Δf max {df_max:.0f} Hz   mean {df_mean:.0f}\n"
+            f"scale ±{fclim:.0f} Hz   frame {self._frame}"
+        )
 
-            self.status.set_text(
-                f"frame={self._frame}  motion={e:.3f}  tracks={len(tracks)}  "
-                f"Δf_max={df_max:.0f}Hz  Δf_mean={df_mean:.0f}Hz  "
-                f"pkts={self.osys.csi_packets}  t={self.osys.t:.1f}s"
-            )
+        hist = self.osys.csi.motion_history if self.osys.csi else []
+        if hist:
+            ys = np.asarray(hist[-200:], dtype=float)
+            xs = np.arange(len(ys))
+            self.hist_line.set_data(xs, ys)
+            self.ax_hist.set_xlim(0, max(50, len(ys)))
+        for rect, h in zip(self.bars, self._sub_bars()):
+            rect.set_height(float(h))
 
-            now = time.time()
-            if now - self._last_log > 1.0:
-                self._last_log = now
-                if abs(df_max - self._last_df_max) > 1.0 or self._frame < 5:
-                    print(
-                        f"[live] frame={self._frame}  Δf_max={df_max:.1f}Hz  "
-                        f"Δf_mean={df_mean:.1f}Hz  motion={e:.3f}  pkts={self.osys.csi_packets}"
-                    )
-                self._last_df_max = df_max
+        self.status.set_text(
+            f"frame={self._frame}  motion={e:.3f}  tracks={len(tracks)}  "
+            f"Δf_max={df_max:.0f}Hz  Δf_mean={df_mean:.0f}Hz  "
+            f"pkts={self.osys.csi_packets}  t={self.osys.t:.1f}s"
+        )
 
-        except Exception as ex:
-            # never let a render error kill the Tk timer into NoneType interval
-            if self._frame % 50 == 1:
-                print(f"[dashboard] update error: {ex}")
-
-        return []
+        now = time.time()
+        if now - self._last_log > 1.0:
+            self._last_log = now
+            if abs(df_max - self._last_df_max) > 1.0 or self._frame < 5:
+                print(
+                    f"[live] frame={self._frame}  Δf_max={df_max:.1f}Hz  "
+                    f"Δf_mean={df_mean:.1f}Hz  motion={e:.3f}  pkts={self.osys.csi_packets}"
+                )
+            self._last_df_max = df_max
 
     def run(self):
         if _BACKEND == "Agg":
-            print("No GUI backend")
+            print("No GUI backend — install tk")
             self.osys.close()
             return
 
-        print(f"[dashboard] backend={_BACKEND}")
-
-        # Strong references + repeat=True keeps event_source alive correctly
-        self._ani = FuncAnimation(
-            self.fig,
-            self.update,
-            interval=50,
-            blit=False,
-            cache_frame_data=False,
-            repeat=True,
-        )
-        # Prevent GC of animation (root cause of event_source -> None)
-        self.fig._echo_grid_ani = self._ani  # type: ignore[attr-defined]
+        print(f"[dashboard] backend={_BACKEND}  (pause-loop, no FuncAnimation)")
+        plt.show(block=False)
+        self.fig.canvas.draw()
 
         try:
-            plt.show(block=True)
+            while self._running and plt.fignum_exists(self.fig.number):
+                self.tick()
+                # process GUI events + small delay (replaces FuncAnimation timer)
+                plt.pause(0.05)
+        except KeyboardInterrupt:
+            pass
         finally:
-            self._on_close()
+            self._running = False
             try:
                 self.osys.save(force=True)
             except Exception:
                 pass
             self.osys.close()
+            try:
+                plt.close(self.fig)
+            except Exception:
+                pass
 
 
 def main():
