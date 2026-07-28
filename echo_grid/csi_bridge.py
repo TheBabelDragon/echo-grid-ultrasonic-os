@@ -1,4 +1,4 @@
-"""CSI Bridge — receive :4210 + closed-loop commands to ESP :4211."""
+"""CSI Bridge — :4210 in, closed-loop cmds + field telemetry on :4211."""
 
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ class CSIBridge:
         try:
             self.cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.cmd_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            print(f"[CSI] command channel → :{self.cmd_port} (closed-loop)")
+            print(f"[CSI] command+telemetry → :{self.cmd_port}")
         except OSError as e:
             print(f"[CSI] cmd socket failed: {e}")
             self.cmd_sock = None
@@ -78,13 +78,10 @@ class CSIBridge:
             return False
         payload = {"type": "echo_cmd", "cmd": cmd, **fields}
         data = json.dumps(payload).encode("utf-8")
-
         targets = []
         if self.last_addr:
             targets.append((self.last_addr[0], self.cmd_port))
-        # subnet broadcast fallback
         targets.append(("255.255.255.255", self.cmd_port))
-
         ok = False
         for host, port in targets:
             try:
@@ -96,14 +93,27 @@ class CSIBridge:
             self.cmd_count += 1
         return ok
 
-    def closed_loop_feedback(self, entropy: float, n_tracks: int, motion: float) -> None:
-        """Map Echo field state → CSI node behavior."""
+    def closed_loop_feedback(
+        self,
+        entropy: float,
+        n_tracks: int,
+        motion: float,
+        df_max: float = 0.0,
+    ) -> None:
         now = time.time()
-        if now - self._last_cmd_t < 0.8:
+        if now - self._last_cmd_t < 0.7:
             return
         self._last_cmd_t = now
 
-        # Decide mode
+        # Always push field telemetry so CYD can mirror the grid
+        self.send_command(
+            "field",
+            entropy=round(float(entropy), 3),
+            tracks=int(n_tracks),
+            motion=round(float(motion), 3),
+            df_max=round(float(df_max), 1),
+        )
+
         if n_tracks >= 2 or motion > 0.55 or entropy > 0.45:
             mode = "boost"
             level = float(min(1.0, 0.4 + 0.4 * motion + 0.2 * min(n_tracks, 3) / 3))
@@ -113,12 +123,11 @@ class CSIBridge:
             self.send_command("quiet")
         else:
             mode = "nominal"
-            # adaptive rate: more motion → faster
             interval = int(max(150, min(900, 700 - 500 * motion)))
             self.send_command("set_rate", interval_ms=interval)
 
         if mode != self._last_mode:
-            print(f"[CSI] closed-loop → {mode} (entropy={entropy:.2f} tracks={n_tracks} motion={motion:.2f})")
+            print(f"[CSI] closed-loop → {mode} (H={entropy:.2f} tracks={n_tracks} df={df_max:.0f})")
             self._last_mode = mode
 
     def poll(self) -> Optional[Dict[str, Any]]:
