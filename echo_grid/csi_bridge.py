@@ -1,4 +1,4 @@
-"""CSI Bridge — real packets + arrays for visualization."""
+"""CSI Bridge — receive :4210 + closed-loop commands to ESP :4211."""
 
 from __future__ import annotations
 
@@ -13,21 +13,26 @@ from .csi_tracks import KalmanTrack, TrackStore
 
 
 class CSIBridge:
-    def __init__(self, port: int = 4210, timeout: float = 0.02):
+    def __init__(self, port: int = 4210, cmd_port: int = 4211, timeout: float = 0.02):
         self.port = port
+        self.cmd_port = cmd_port
         self.timeout = timeout
         self.sock: Optional[socket.socket] = None
+        self.cmd_sock: Optional[socket.socket] = None
         self.last_packet: Optional[Dict[str, Any]] = None
         self.last_energy: float = 0.0
         self.last_rssi: float = -90.0
         self.packet_count: int = 0
         self.last_rx_time: float = 0.0
+        self.last_addr: Optional[Tuple[str, int]] = None
         self._logged = 0
+        self._last_cmd_t = 0.0
+        self._last_mode = ""
         self.tracks = TrackStore(max_tracks=6, ttl_s=2.2)
-        # visualization buffers
         self.last_vals: Optional[np.ndarray] = None
         self.last_residual: Optional[np.ndarray] = None
         self.motion_history: List[float] = []
+        self.cmd_count = 0
         self._open()
 
     def _open(self) -> None:
@@ -50,13 +55,71 @@ class CSIBridge:
             print(f"[CSI] bind failed: {e}")
             self.sock = None
 
+        try:
+            self.cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.cmd_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            print(f"[CSI] command channel → :{self.cmd_port} (closed-loop)")
+        except OSError as e:
+            print(f"[CSI] cmd socket failed: {e}")
+            self.cmd_sock = None
+
     def close(self) -> None:
-        if self.sock:
+        for s in (self.sock, self.cmd_sock):
+            if s:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+        self.sock = None
+        self.cmd_sock = None
+
+    def send_command(self, cmd: str, **fields: Any) -> bool:
+        if self.cmd_sock is None:
+            return False
+        payload = {"type": "echo_cmd", "cmd": cmd, **fields}
+        data = json.dumps(payload).encode("utf-8")
+
+        targets = []
+        if self.last_addr:
+            targets.append((self.last_addr[0], self.cmd_port))
+        # subnet broadcast fallback
+        targets.append(("255.255.255.255", self.cmd_port))
+
+        ok = False
+        for host, port in targets:
             try:
-                self.sock.close()
-            except Exception:
-                pass
-            self.sock = None
+                self.cmd_sock.sendto(data, (host, port))
+                ok = True
+            except OSError:
+                continue
+        if ok:
+            self.cmd_count += 1
+        return ok
+
+    def closed_loop_feedback(self, entropy: float, n_tracks: int, motion: float) -> None:
+        """Map Echo field state → CSI node behavior."""
+        now = time.time()
+        if now - self._last_cmd_t < 0.8:
+            return
+        self._last_cmd_t = now
+
+        # Decide mode
+        if n_tracks >= 2 or motion > 0.55 or entropy > 0.45:
+            mode = "boost"
+            level = float(min(1.0, 0.4 + 0.4 * motion + 0.2 * min(n_tracks, 3) / 3))
+            self.send_command("boost", level=round(level, 2))
+        elif motion < 0.08 and entropy < 0.12 and n_tracks == 0:
+            mode = "quiet"
+            self.send_command("quiet")
+        else:
+            mode = "nominal"
+            # adaptive rate: more motion → faster
+            interval = int(max(150, min(900, 700 - 500 * motion)))
+            self.send_command("set_rate", interval_ms=interval)
+
+        if mode != self._last_mode:
+            print(f"[CSI] closed-loop → {mode} (entropy={entropy:.2f} tracks={n_tracks} motion={motion:.2f})")
+            self._last_mode = mode
 
     def poll(self) -> Optional[Dict[str, Any]]:
         if self.sock is None:
@@ -73,6 +136,8 @@ class CSIBridge:
                 if not isinstance(pkt, dict):
                     continue
                 latest = pkt
+                if addr:
+                    self.last_addr = addr
                 self.tracks.update_from_packet(pkt)
             except socket.timeout:
                 break
@@ -107,13 +172,11 @@ class CSIBridge:
         return latest
 
     def spatial_map(self, size: int = 16) -> np.ndarray:
-        """Project CSI residual into a size×size spatial field for display."""
         grid = np.zeros((size, size), dtype=np.float32)
         res = self.last_residual
         vals = self.last_vals
         src = res if res is not None and len(res) > 4 else vals
         if src is None or len(src) < 4:
-            # fallback: paint tracks
             for tr in self.active_tracks():
                 x, y = tr.pos
                 ix = int(np.clip(x * (size - 1), 0, size - 1))
@@ -126,11 +189,9 @@ class CSIBridge:
 
         n = len(src)
         for k, v in enumerate(src):
-            # map subcarrier index → x; amplitude → y-band energy
             x = k / max(1, n - 1)
             ix = int(np.clip(x * (size - 1), 0, size - 1))
             amp = float(max(0.0, v))
-            # spread vertically proportional to amplitude
             cy = 0.35 + 0.45 * min(1.0, amp)
             iy = int(np.clip(cy * (size - 1), 0, size - 1))
             for j in range(size):

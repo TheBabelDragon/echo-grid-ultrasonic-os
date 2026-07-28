@@ -1,4 +1,4 @@
-"""Echo Grid — real CSI/body with bounded field (no Δf runaway)."""
+"""Echo Grid — closed-loop CSI feedback to ESP nodes."""
 
 from __future__ import annotations
 
@@ -16,14 +16,13 @@ class EchoFieldOS:
         self.phi = np.zeros((size, size), dtype=np.float32)
         self.vel = np.zeros((size, size), dtype=np.float32)
         self.lmbda = 0.09
-        self.gamma = 0.90          # stronger damping — stops red flood
+        self.gamma = 0.90
         self.max_abs = 2.5
         self.entropy = 0.0
 
     def inject(self, x: float, y: float, force: float = 1.0):
         ix = int(np.clip(x * self.size, 0, self.size - 1))
         iy = int(np.clip(y * self.size, 0, self.size - 1))
-        # soft-cap force so continuous CSI cannot pile up forever
         force = float(np.clip(force, -1.2, 1.2))
         for j in range(self.size):
             for i in range(self.size):
@@ -39,7 +38,6 @@ class EchoFieldOS:
         self.vel += (lap - self.phi) * self.lmbda
         self.vel *= self.gamma
         self.phi += self.vel
-        # leak toward zero so steady injection reaches equilibrium, not infinity
         self.phi *= 0.997
         np.clip(self.phi, -self.max_abs, self.max_abs, out=self.phi)
         np.clip(self.vel, -self.max_abs, self.max_abs, out=self.vel)
@@ -53,7 +51,6 @@ class UltrasonicMapper:
         self.k = k
 
     def delta_f(self, field: np.ndarray) -> np.ndarray:
-        # zero-mean so panel shows structure, not a global red bias
         f = field - float(np.mean(field))
         return f * self.k
 
@@ -110,7 +107,6 @@ class EchoGridOS:
             tracks = self.csi.active_tracks()
             if tracks:
                 for tr in tracks:
-                    # only confident moving/surging bodies drive the field hard
                     if tr.confidence < 0.35:
                         continue
                     gain = 0.55 if tr.state == "idle" else (0.9 if tr.state == "move" else 1.15)
@@ -132,6 +128,15 @@ class EchoGridOS:
 
         phi = self.field.step()
 
+        # Closed-loop back to CSI ESP
+        if closed_loop and self.csi is not None:
+            ntr = len(self.csi.active_tracks())
+            self.csi.closed_loop_feedback(
+                entropy=self.field.entropy,
+                n_tracks=ntr,
+                motion=self.last_csi_energy,
+            )
+
         if drive_body and self.body is not None:
             energies = self.mapper.region_energies(phi, 4)
             best = int(np.argmax(energies))
@@ -146,10 +151,11 @@ class EchoGridOS:
         if now - self._status_t >= 1.2:
             self._status_t = now
             ntr = len(self.csi.active_tracks()) if self.csi else 0
+            cmds = self.csi.cmd_count if self.csi else 0
             df = self.mapper.delta_f(phi)
             print(
                 f"[field] entropy={self.field.entropy:.3f}  motion={self.last_csi_energy:.3f}  "
-                f"tracks={ntr}  Δf_max={float(np.max(np.abs(df))):.0f}Hz  "
+                f"tracks={ntr}  cmds={cmds}  Δf_max={float(np.max(np.abs(df))):.0f}Hz  "
                 f"pkts={self.csi_packets}  t={self.t:.1f}s"
             )
         return phi
