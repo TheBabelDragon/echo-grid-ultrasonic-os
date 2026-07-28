@@ -1,5 +1,5 @@
 """
-Echo Grid Ultrasonic OS — Core Kernel (multi-track CSI)
+Echo Grid Ultrasonic OS — Core (Kalman multi-track CSI inject)
 """
 
 from __future__ import annotations
@@ -81,12 +81,7 @@ class UltrasonicMapper:
 
 
 class EchoGridOS:
-    def __init__(
-        self,
-        size: int = 16,
-        body_port: Optional[str] = None,
-        csi_port: Optional[int] = None,
-    ):
+    def __init__(self, size: int = 16, body_port: Optional[str] = None, csi_port: Optional[int] = None):
         self.field = EchoFieldOS(size)
         self.mapper = UltrasonicMapper()
         self.t = 0.0
@@ -107,20 +102,16 @@ class EchoGridOS:
                 self.body = FieldBodyClient(port=body_port if body_port else None)
                 self.body.connect()
                 self.body_connected = True
-                print("[EchoGridOS] body attached")
             except Exception as e:
                 print(f"[EchoGridOS] body unavailable ({e})")
-                self.body = None
 
         if csi_port is not None:
             try:
                 from .csi_bridge import CSIBridge
-                port = int(csi_port) if csi_port else 4210
-                self.csi = CSIBridge(port=port)
+                self.csi = CSIBridge(port=int(csi_port) if csi_port else 4210)
                 self.csi_enabled = self.csi.sock is not None
             except Exception as e:
                 print(f"[EchoGridOS] CSI unavailable ({e})")
-                self.csi = None
 
     def touch(self, x: float, y: float, strength: float = 1.0):
         self.field.inject(x, y, strength)
@@ -130,16 +121,10 @@ class EchoGridOS:
             self.csi.poll()
             self.last_csi_energy = self.csi.last_energy
             self.csi_packets = self.csi.packet_count
-            # multi-track field injection
-            tracks = self.csi.active_tracks()
-            if tracks:
-                for tr in tracks:
-                    if tr.energy > 0.02:
-                        self.field.inject(tr.x, tr.y, force=tr.energy * 0.75)
-            else:
-                x, y, force = self.csi.injection_point()
-                if force > 0.015:
-                    self.field.inject(x, y, force=force * 0.9)
+            for tr in self.csi.active_tracks():
+                if tr.energy > 0.02:
+                    x, y = tr.pos
+                    self.field.inject(x, y, force=tr.energy * 0.55 * tr.confidence)
 
         if closed_loop and self.body is not None:
             obs = self.body.poll_observation()
@@ -163,28 +148,21 @@ class EchoGridOS:
                     pass
 
         self.t += 0.016
-
         now = time.time()
         if now - self._status_t >= 1.5:
             self._status_t = now
-            ntr = 0
-            if self.csi is not None:
-                ntr = len(self.csi.active_tracks())
-            mode_bits = []
+            ntr = len(self.csi.active_tracks()) if self.csi else 0
+            modes = []
             if self.body_connected:
-                mode_bits.append("body")
+                modes.append("body")
             if self.csi_enabled:
-                mode_bits.append("csi")
-            if not mode_bits:
-                mode_bits.append("soft")
+                modes.append("csi")
+            if not modes:
+                modes.append("soft")
             print(
-                f"[field] mode={'+'.join(mode_bits)}  "
-                f"entropy={self.field.entropy:.3f}  "
-                f"csi={self.last_csi_energy:.3f}  "
-                f"tracks={ntr}  pkts={self.csi_packets}  "
-                f"t={self.t:.1f}s"
+                f"[field] mode={'+'.join(modes)}  entropy={self.field.entropy:.3f}  "
+                f"csi={self.last_csi_energy:.3f}  tracks={ntr}  pkts={self.csi_packets}  t={self.t:.1f}s"
             )
-
         return phi
 
     def save(self, force: bool = False):
@@ -192,15 +170,14 @@ class EchoGridOS:
         if not force and bucket == self._last_save_bucket:
             return
         self._last_save_bucket = bucket
-        data = {
-            "phi": self.field.phi.tolist(),
-            "vel": self.field.vel.tolist(),
-            "entropy": self.field.entropy,
-            "t": self.t,
-            "timestamp": time.time(),
-        }
         with open(self.save_path, "w") as f:
-            json.dump(data, f, indent=2)
+            json.dump({
+                "phi": self.field.phi.tolist(),
+                "vel": self.field.vel.tolist(),
+                "entropy": self.field.entropy,
+                "t": self.t,
+                "timestamp": time.time(),
+            }, f, indent=2)
         print(f"✅ saved → {self.save_path}")
 
     def close(self):
@@ -210,7 +187,5 @@ class EchoGridOS:
                 self.body.close()
             except Exception:
                 pass
-            self.body_connected = False
         if self.csi:
             self.csi.close()
-            self.csi_enabled = False

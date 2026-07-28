@@ -1,5 +1,5 @@
 """
-CSI Bridge — UDP :4210 + multi-body track store.
+CSI Bridge — UDP :4210 + Kalman multi-target tracks.
 """
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ import socket
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from .csi_tracks import Track, TrackStore
+from .csi_tracks import KalmanTrack, TrackStore
 
 
 class CSIBridge:
@@ -22,9 +22,8 @@ class CSIBridge:
         self.last_rssi: float = -90.0
         self.packet_count: int = 0
         self.last_rx_time: float = 0.0
-        self._baseline: Optional[List[float]] = None
         self._logged = 0
-        self.tracks = TrackStore(max_tracks=6, ttl_s=3.0)
+        self.tracks = TrackStore(max_tracks=8, ttl_s=2.8)
         self._open()
 
     def _open(self) -> None:
@@ -42,9 +41,9 @@ class CSIBridge:
                 pass
             self.sock.bind(("0.0.0.0", self.port))
             self.sock.settimeout(self.timeout)
-            print(f"[CSI] listening UDP 0.0.0.0:{self.port} (multi-track)")
+            print(f"[CSI] listening :{self.port} (Kalman multi-track)")
         except OSError as e:
-            print(f"[CSI] bind failed on :{self.port} ({e})")
+            print(f"[CSI] bind failed: {e}")
             self.sock = None
 
     def close(self) -> None:
@@ -55,32 +54,14 @@ class CSIBridge:
                 pass
             self.sock = None
 
-    def _energy_from_packet(self, pkt: Dict[str, Any]) -> float:
-        candidates = []
+    def _energy(self, pkt: Dict[str, Any]) -> float:
         for key in ("movement_intensity", "activity", "confidence"):
             if key in pkt and pkt[key] is not None:
                 try:
-                    candidates.append(float(pkt[key]))
+                    return float(min(1.0, max(0.0, float(pkt[key]))))
                 except (TypeError, ValueError):
                     pass
-        if candidates:
-            return float(min(1.0, max(0.0, max(candidates))))
-
-        csi = pkt.get("csi") or []
-        try:
-            csi_f = [float(x) for x in csi]
-        except (TypeError, ValueError):
-            return 0.0
-        if not csi_f:
-            return 0.0
-        if self._baseline is None or len(self._baseline) != len(csi_f):
-            self._baseline = list(csi_f)
-            return 0.05
-        dev = [abs(a - b) for a, b in zip(csi_f, self._baseline)]
-        energy = sum(dev) / max(1, len(dev))
-        alpha = 0.05
-        self._baseline = [(1 - alpha) * b + alpha * a for a, b in zip(csi_f, self._baseline)]
-        return float(min(1.0, energy * 4.0))
+        return 0.0
 
     def poll(self) -> Optional[Dict[str, Any]]:
         if self.sock is None:
@@ -99,7 +80,6 @@ class CSIBridge:
                     continue
                 latest = pkt
                 latest_addr = addr
-                # update tracks for every packet in the drain
                 self.tracks.update_from_packet(pkt)
             except socket.timeout:
                 break
@@ -108,7 +88,7 @@ class CSIBridge:
 
         if latest is None:
             if self.last_rx_time and (time.time() - self.last_rx_time) > 2.0:
-                self.last_energy *= 0.92
+                self.last_energy *= 0.90
                 if self.last_energy < 0.01:
                     self.last_energy = 0.0
             return None
@@ -116,7 +96,7 @@ class CSIBridge:
         self.last_packet = latest
         self.packet_count += 1
         self.last_rx_time = time.time()
-        self.last_energy = self._energy_from_packet(latest)
+        self.last_energy = self._energy(latest)
         try:
             self.last_rssi = float(latest.get("rssi", -90))
         except (TypeError, ValueError):
@@ -128,18 +108,17 @@ class CSIBridge:
                 f"energy={self.last_energy:.3f}  tracks={len(self.tracks.active())}"
             )
             self._logged += 1
-
         return latest
 
     def injection_point(self) -> Tuple[float, float, float]:
-        force = self.last_energy
-        if force < 0.015:
-            return (0.5, 0.5, 0.0)
-        active = self.tracks.active()
+        active = self.active_tracks()
         if active:
             t = active[0]
-            return (t.x, t.y, min(1.2, t.energy))
-        return (0.5, 0.5, min(1.2, force))
+            x, y = t.pos
+            return (x, y, min(1.2, t.energy))
+        if self.last_energy < 0.015:
+            return (0.5, 0.5, 0.0)
+        return (0.5, 0.5, min(1.2, self.last_energy))
 
-    def active_tracks(self) -> List[Track]:
+    def active_tracks(self) -> List[KalmanTrack]:
         return self.tracks.active()
