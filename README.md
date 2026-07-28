@@ -10,26 +10,34 @@ Sibling to the optical body under the shared [Field Body Protocol](docs/FIELD_BO
 ```bash
 pip install -r requirements.txt
 
-# software only (stable, production defaults)
+# software only
 python main.py
+
+# live visualization (recommended)
+python visualization/dashboard.py
 
 # with physical Echo Body
 python main.py --body
-python main.py --body /dev/ttyUSB0 --drive
+python visualization/dashboard.py --body --drive
 ```
 
-## What you should see
+## Live view
+
+```bash
+python visualization/dashboard.py
+```
+
+Shows:
+- Phase field φ
+- Frequency map (Hz)
+- Live entropy / observation / time
+
+## What you should see (CLI)
 
 ```
 [field] mode=soft  entropy=0.412  obs=0.000  t=3.2s
 ✅ saved → echo_save.json
 ```
-
-- `mode=soft` — no body attached  
-- `mode=body` — closed-loop body connected  
-- `entropy` stays bounded (soft clamp)  
-- `obs` rises only when a real sensor reports energy  
-- saves happen once per interval, not in a spam burst
 
 ## Layout
 
