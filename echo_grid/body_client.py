@@ -1,13 +1,16 @@
 """
 Field Body Client — host side of the Field Body Protocol
-Supports both commands (host→body) and observations (body→host).
+
+Accepts observations from both:
+  - Echo Body (compact OBS {..} lines)
+  - optical-body-s3 (rich JSON + compact OBS lines)
 """
 
 from __future__ import annotations
 
 import json
 import time
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 
 try:
     import serial
@@ -66,18 +69,59 @@ class FieldBodyClient:
     def passive(self) -> None:
         self._send("PASSIVE")
 
+    def _normalize_obs(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize rich optical format into the compact shape the kernel expects."""
+        if "regions" in data:
+            return data
+
+        # optical rich format uses "field_regions"
+        regions = data.get("field_regions") or data.get("regions") or []
+        if not regions and "modality" in data:
+            # fallback single value if somehow present
+            regions = [{"region": "optical", "observed": 0.0, "confidence": 0.5}]
+
+        # pick the strongest region for simple closed-loop use
+        best = None
+        best_val = -1.0
+        for r in regions:
+            val = float(r.get("observed", 0.0))
+            if val > best_val:
+                best_val = val
+                best = r
+
+        return {
+            "body_id": data.get("body_id", "unknown"),
+            "body_type": data.get("body_type", "optical"),
+            "excitation_id": data.get("excitation_id", data.get("modality", {}).get("laser_id", -1)),
+            "geometry_state": data.get("geometry_state", "unknown"),
+            "health": data.get("health", "ok"),
+            "regions": [best] if best else [{"region": "none", "observed": 0.0, "confidence": 0.0}],
+        }
+
     def poll_observation(self) -> Optional[Dict[str, Any]]:
-        """Non-blocking read of the latest OBS line from the body."""
+        """Non-blocking read. Accepts both OBS {..} and raw rich JSON."""
         if not self._ser or not self._ser.is_open:
             return None
+
         while self._ser.in_waiting:
             try:
                 raw = self._ser.readline().decode("utf-8", errors="ignore").strip()
+                if not raw:
+                    continue
+
+                payload = None
                 if raw.startswith("OBS "):
                     payload = raw[4:]
-                    obs = json.loads(payload)
-                    self.last_observation = obs
-                    return obs
+                elif raw.startswith("{") and ("body_type" in raw or "field_regions" in raw or "regions" in raw):
+                    payload = raw
+
+                if payload is None:
+                    continue
+
+                data = json.loads(payload)
+                obs = self._normalize_obs(data)
+                self.last_observation = obs
+                return obs
             except Exception:
                 continue
         return None
