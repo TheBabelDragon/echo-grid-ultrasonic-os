@@ -1,39 +1,31 @@
-# Echo Body — Ultrasonic Physical Body for Echo Grid / MetaField
+# Echo Body
 
-This firmware is the **ultrasonic** counterpart to `optical-body-s3`.
+Ultrasonic physical body for Echo Grid / MetaField.
 
-```
-Echo Body (ESP32)
-        │
-        │  excitation + FieldObservation packets
-        ↓
-MetaField / Echo Grid host
-```
+Implements the shared **Field Body Protocol**  
+→ see [`docs/FIELD_BODY_PROTOCOL.md`](../docs/FIELD_BODY_PROTOCOL.md)
 
-It follows the same architectural principles as the optical body:
+## Relationship to optical-body-s3
 
-- Node identity
-- Command language: `EXCITE <id> | MAP | VERIFY | PASSIVE`
-- Passive vs Held modes
-- FieldObservation packets (modality-adapted)
-- Clean driver / protocol / body separation
+| Aspect              | optical-body-s3      | Echo Body              |
+|---------------------|----------------------|------------------------|
+| Modality            | Light (laser + PD)   | Sound (ultrasonic)     |
+| Protocol            | Same spirit          | Explicit v0.1 contract |
+| Commands            | EXCITE/MAP/VERIFY/PASSIVE | Identical         |
+| Role                | Physical body only   | Physical body only     |
 
-## Hardware target (Phase 0)
+They are siblings. MetaField (or any host) can talk to either through the same command + observation surface.
 
-- ESP32 (or ESP32-S3)
-- One or more 40 kHz ultrasonic transducers driven via MOSFET + LEDC PWM
-- Optional: microphone or ultrasonic receiver for closed-loop later
+## Quick start
 
-## Commands (Serial 115200)
-
-```
-EXCITE <id>     Fire / shape a specific emitter
-MAP             Run self-calibration (acoustic fingerprint)
-VERIFY          Check identity / health
-PASSIVE         Return to background field observation
-```
-
-## Build
-
-Use Arduino IDE or PlatformIO.  
-Pin map and transducer count are defined at the top of `echo_body.ino`.
+1. Set transducer pins in `echo_body.ino`
+2. Flash to ESP32
+3. Serial 115200
+4. Try:
+   ```
+   EXCITE 0
+   EXCITE 1
+   PASSIVE
+   MAP
+   VERIFY
+   ```

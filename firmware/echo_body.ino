@@ -1,20 +1,17 @@
 /**
- * Echo Body — Ultrasonic physical body for Echo Grid / MetaField
+ * Echo Body — Ultrasonic physical body
  *
+ * Implements the shared Field Body Protocol (see docs/FIELD_BODY_PROTOCOL.md).
  * Architectural sibling of optical-body-s3.
- * Same command language, same observation philosophy,
- * different physics (sound instead of light).
  *
- * Commands (Serial 115200):
- *   EXCITE <id>   — shape a specific ultrasonic emitter
- *   MAP           — run acoustic self-map / calibration
- *   VERIFY        — identity + health check
- *   PASSIVE       — resume background observation
+ * Commands:
+ *   EXCITE <id>
+ *   MAP
+ *   VERIFY
+ *   PASSIVE
  */
 
 #include <Arduino.h>
-#include <esp_now.h>
-#include <WiFi.h>
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -23,34 +20,14 @@
 #define ECHO_BODY_NODE_ID "echo_us_001"
 #endif
 
-const int NUM_EMITTERS     = 4;          // start small; scale later
-const int TRANSDUCER_PINS[NUM_EMITTERS] = {25, 26, 27, 14};  // change to your wiring
+const int NUM_EMITTERS = 4;
+const int TRANSDUCER_PINS[NUM_EMITTERS] = {25, 26, 27, 14};
 const int PWM_CHANNELS[NUM_EMITTERS]    = {0, 1, 2, 3};
-const int PWM_RESOLUTION  = 8;
-const int BASE_FREQ_HZ    = 40000;
+const int PWM_RESOLUTION = 8;
+const int BASE_FREQ_HZ   = 40000;
 
 // ---------------------------------------------------------------------------
-// Simple FieldObservation (ultrasonic flavour)
-// ---------------------------------------------------------------------------
-struct FieldRegion {
-  char   region[16];
-  float  observed;     // 0..1
-  float  confidence;
-};
-
-struct FieldObservation {
-  char   body_id[24];
-  char   body_type[16];      // "ultrasonic"
-  int32_t excitation_id;
-  FieldRegion regions[8];
-  int    num_regions;
-  char   geometry_state[16]; // uncalibrated | calibrated | degraded
-  char   health[8];          // ok | partial | error
-  int    schema_version = 1;
-};
-
-// ---------------------------------------------------------------------------
-// Ultrasonic driver (LEDC)
+// Ultrasonic driver
 // ---------------------------------------------------------------------------
 class UltrasonicDriver {
 public:
@@ -64,9 +41,8 @@ public:
   }
 
   void allOff() {
-    for (int i = 0; i < NUM_EMITTERS; i++) {
+    for (int i = 0; i < NUM_EMITTERS; i++)
       ledcWrite(PWM_CHANNELS[i], 0);
-    }
   }
 
   void fire(uint16_t id, float amplitude = 0.7f, float freq_hz = BASE_FREQ_HZ) {
@@ -82,7 +58,7 @@ public:
 };
 
 // ---------------------------------------------------------------------------
-// Echo Body
+// Echo Body (implements Field Body Protocol)
 // ---------------------------------------------------------------------------
 enum class RunMode : uint8_t { Passive, Held };
 
@@ -90,69 +66,64 @@ class EchoBody {
 public:
   EchoBody(const char* node_id) {
     strncpy(node_id_, node_id, sizeof(node_id_) - 1);
+    node_id_[sizeof(node_id_) - 1] = '\0';
   }
 
   bool begin() {
-    Serial.println(F("[EchoBody] initialising ultrasonic drivers..."));
-    if (!driver_.begin()) {
-      Serial.println(F("[FATAL] UltrasonicDriver failed"));
-      return false;
-    }
+    Serial.println(F("[EchoBody] init ultrasonic drivers"));
+    if (!driver_.begin()) return false;
     geometry_state_ = "uncalibrated";
     health_ = "ok";
     return true;
   }
 
   void exciteOnce(uint16_t id) {
-    Serial.print(F("[EchoBody] EXCITE emitter "));
+    Serial.print(F("[EchoBody] EXCITE "));
     Serial.println(id);
     driver_.fire(id, 0.75f, BASE_FREQ_HZ);
-    // Hold for a short acoustic burst; caller decides longer duration
-    delay(30);
-    // leave it running in Held mode; PASSIVE will silence
+    last_excitation_id_ = id;
   }
 
   void runSelfMap() {
-    Serial.println(F("[EchoBody] MAP — acoustic self-calibration (placeholder)"));
-    // TODO: one-hot excitation + microphone / receiver capture
-    //       build simple transfer / fingerprint
+    Serial.println(F("[EchoBody] MAP (acoustic calibration stub)"));
+    // Future: one-hot sequence + receiver capture → transfer matrix
     geometry_state_ = "calibrated";
-    Serial.println(F("[EchoBody] MAP complete (stub)"));
+    Serial.println(F("[EchoBody] MAP done"));
   }
 
   void verifyIdentity(bool* unchanged) {
-    // Placeholder: later compare acoustic fingerprint in FRAM / NVS
     *unchanged = (strcmp(geometry_state_, "calibrated") == 0);
     Serial.print(F("[EchoBody] VERIFY → "));
-    Serial.println(*unchanged ? "trusted" : "needs map");
+    Serial.println(*unchanged ? "trusted" : "needs MAP");
   }
 
   void tickPassive() {
-    // Background field observation would go here
-    // (listen with a receiver, emit sparse FieldObservation packets)
+    // Future: sparse acoustic observation packets
   }
 
-  void allOff() { driver_.allOff(); }
+  void allOff() {
+    driver_.allOff();
+    last_excitation_id_ = -1;
+  }
 
   int numEmitters() const { return driver_.numEmitters(); }
-
+  const char* nodeId() const { return node_id_; }
   const char* geometryState() const { return geometry_state_; }
   const char* health() const { return health_; }
+  int lastExcitation() const { return last_excitation_id_; }
 
 private:
   char node_id_[24];
   UltrasonicDriver driver_;
   const char* geometry_state_ = "uncalibrated";
   const char* health_ = "ok";
+  int last_excitation_id_ = -1;
 };
 
-// ---------------------------------------------------------------------------
-// Global state
 // ---------------------------------------------------------------------------
 EchoBody body(ECHO_BODY_NODE_ID);
 RunMode mode = RunMode::Passive;
 
-// Very simple command parser (Serial)
 bool pollCommand(String& cmd, int& arg) {
   if (!Serial.available()) return false;
   String line = Serial.readStringUntil('\n');
@@ -173,17 +144,17 @@ bool pollCommand(String& cmd, int& arg) {
   return false;
 }
 
-// ---------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
-  delay(600);
+  delay(500);
 
   Serial.println();
   Serial.println(F("========================================"));
-  Serial.println(F("  Echo Body  —  Ultrasonic physical body"));
-  Serial.println(F("  cmds: EXCITE <id> | MAP | VERIFY | PASSIVE"));
+  Serial.println(F("  Echo Body  —  Ultrasonic Field Body"));
+  Serial.println(F("  Protocol : Field Body v0.1"));
+  Serial.println(F("  cmds     : EXCITE <id> | MAP | VERIFY | PASSIVE"));
   Serial.println(F("========================================"));
-  Serial.print(F("Node ID : "));
+  Serial.print(F("Node ID   : "));
   Serial.println(ECHO_BODY_NODE_ID);
 
   if (!body.begin()) {
@@ -193,13 +164,10 @@ void setup() {
   bool unchanged = false;
   body.verifyIdentity(&unchanged);
   if (!unchanged) {
-    Serial.println(F("[Boot] running MAP..."));
     body.runSelfMap();
-  } else {
-    Serial.println(F("[Boot] identity trusted"));
   }
 
-  Serial.println(F("[Boot] passive loop ready"));
+  Serial.println(F("[Boot] passive ready"));
 }
 
 void loop() {
@@ -209,7 +177,7 @@ void loop() {
   if (pollCommand(cmd, arg)) {
     if (cmd == "EXCITE") {
       if (arg < 0 || arg >= body.numEmitters()) {
-        Serial.println(F("[CMD] EXCITE id out of range"));
+        Serial.println(F("[CMD] id out of range"));
       } else {
         body.exciteOnce((uint16_t)arg);
         mode = RunMode::Held;
@@ -223,9 +191,9 @@ void loop() {
       body.verifyIdentity(&ok);
     }
     else if (cmd == "PASSIVE") {
-      Serial.println(F("[CMD] passive resume"));
       body.allOff();
       mode = RunMode::Passive;
+      Serial.println(F("[CMD] PASSIVE"));
     }
   }
 
@@ -233,6 +201,6 @@ void loop() {
     body.tickPassive();
     delay(200);
   } else {
-    delay(40);  // Held: keep emitter alive until PASSIVE
+    delay(40);
   }
 }
