@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Echo Grid live stack — bounded Δf scale (no red flood)."""
+"""Echo Grid live stack — actuator |offset| map (no grey dead-zone)."""
 
 from __future__ import annotations
 
@@ -47,8 +47,7 @@ class LiveDashboard:
         self._frame = 0
         self._last_log = 0.0
         self._running = True
-        # rolling clim for Δf — decays so it cannot stick at max red
-        self._df_clim = 200.0
+        self._df_clim = 300.0
 
         self.fig = plt.figure(figsize=(12, 9))
         gs = self.fig.add_gridspec(2, 2, hspace=0.32, wspace=0.28)
@@ -87,14 +86,15 @@ class LiveDashboard:
             bbox=dict(boxstyle="round,pad=0.25", facecolor="#222", alpha=0.75),
         )
 
+        # Actuator panel: |Hz offset| with inferno — never coolwarm-grey
         self.im_df = self.ax_df.imshow(
-            z.copy(), cmap="coolwarm", vmin=-300, vmax=300, origin="lower", extent=[0, 1, 0, 1],
+            z.copy(), cmap="inferno", vmin=0, vmax=400, origin="lower", extent=[0, 1, 0, 1],
         )
-        self.ax_df.set_title("3 · Actuator Δf (bounded)", fontsize=11)
+        self.ax_df.set_title("3 · Actuator |Δf| (Hz from 40 kHz)", fontsize=11)
         self.cbar_df = self.fig.colorbar(self.im_df, ax=self.ax_df, fraction=0.046, pad=0.04)
-        self.cbar_df.set_label("Hz from 40 kHz")
+        self.cbar_df.set_label("|Hz|")
         self.df_readout = self.ax_df.text(
-            0.02, 0.98, "Δf max —", transform=self.ax_df.transAxes,
+            0.02, 0.98, "|Δf| max —", transform=self.ax_df.transAxes,
             ha="left", va="top", fontsize=9, family="monospace", color="white",
             bbox=dict(boxstyle="round,pad=0.25", facecolor="#222", alpha=0.75),
         )
@@ -142,7 +142,7 @@ class LiveDashboard:
 
         self.im_phi.set_data(phi_view)
         lo, hi = np.percentile(phi_view, [5, 95])
-        span = max(0.1, float(hi - lo) * 0.55 + 1e-6)
+        span = max(0.12, float(hi - lo) * 0.55 + 1e-6)
         mid = float(phi_view.mean())
         self.im_phi.set_clim(mid - 2.5 * span, mid + 2.5 * span)
 
@@ -177,22 +177,22 @@ class LiveDashboard:
             f"tracks {len(tracks)}   rssi {self.osys.csi.last_rssi if self.osys.csi else 0:.0f}"
         )
 
-        # Δf — zero-mean structure + rolling clim that DECAYS (no permanent red)
-        df = np.array(self.osys.mapper.delta_f(phi_view), dtype=np.float32, copy=True)
-        self.im_df.set_data(df)
-        abs_df = np.abs(df)
-        df_max = float(abs_df.max())
-        df_mean = float(abs_df.mean())
-        target = max(80.0, min(1200.0, float(np.percentile(abs_df, 92)) * 1.6 + 40.0))
-        # climb fast, fall slow but steadily — prevents flood lock
+        # |delta-f| map — inferno is black→yellow, never mid-grey flood
+        df_abs = np.array(self.osys.mapper.delta_f_abs(phi_view), dtype=np.float32, copy=True)
+        self.im_df.set_data(df_abs)
+        df_max = float(df_abs.max())
+        df_mean = float(df_abs.mean())
+        p90 = float(np.percentile(df_abs, 90))
+        target = max(120.0, min(1800.0, p90 * 1.8 + 80.0, df_max * 1.1 + 50.0))
         if target > self._df_clim:
-            self._df_clim = 0.65 * self._df_clim + 0.35 * target
+            self._df_clim = 0.55 * self._df_clim + 0.45 * target
         else:
-            self._df_clim = 0.92 * self._df_clim + 0.08 * target
-        self.im_df.set_clim(-self._df_clim, self._df_clim)
+            self._df_clim = 0.90 * self._df_clim + 0.10 * target
+        # hard floor so empty field is dark, not washed grey
+        self.im_df.set_clim(0.0, max(120.0, self._df_clim))
         self.df_readout.set_text(
-            f"Δf max {df_max:.0f} Hz   mean {df_mean:.0f}\n"
-            f"scale ±{self._df_clim:.0f} Hz   frame {self._frame}"
+            f"|Δf| max {df_max:.0f} Hz   mean {df_mean:.0f}\n"
+            f"scale 0–{self._df_clim:.0f} Hz   drive {self.osys.field._drive:.2f}"
         )
 
         hist = self.osys.csi.motion_history if self.osys.csi else []
@@ -205,7 +205,7 @@ class LiveDashboard:
 
         self.status.set_text(
             f"frame={self._frame}  motion={e:.3f}  tracks={len(tracks)}  "
-            f"Δf_max={df_max:.0f}Hz  scale=±{self._df_clim:.0f}  "
+            f"|Δf|_max={df_max:.0f}Hz  drive={self.osys.field._drive:.2f}  "
             f"pkts={self.osys.csi_packets}  t={self.osys.t:.1f}s"
         )
 
@@ -213,8 +213,8 @@ class LiveDashboard:
         if now - self._last_log > 1.0:
             self._last_log = now
             print(
-                f"[live] frame={self._frame}  Δf_max={df_max:.1f}  "
-                f"scale=±{self._df_clim:.0f}  motion={e:.3f}  tracks={len(tracks)}"
+                f"[live] |Δf|_max={df_max:.1f}  scale={self._df_clim:.0f}  "
+                f"drive={self.osys.field._drive:.2f}  motion={e:.3f}  tracks={len(tracks)}"
             )
 
     def run(self):
