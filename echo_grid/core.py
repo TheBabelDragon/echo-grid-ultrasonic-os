@@ -100,6 +100,7 @@ class EchoGridOS:
         self.csi = None
         self.last_obs = 0.0
         self.last_csi_energy = 0.0
+        self.csi_packets = 0
         self._status_t = 0.0
         self._last_save_bucket = -1
         self.body_connected = False
@@ -119,7 +120,8 @@ class EchoGridOS:
         if csi_port is not None:
             try:
                 from .csi_bridge import CSIBridge
-                self.csi = CSIBridge(port=csi_port if csi_port else 4210)
+                port = int(csi_port) if csi_port else 4210
+                self.csi = CSIBridge(port=port)
                 self.csi_enabled = self.csi.sock is not None
             except Exception as e:
                 print(f"[EchoGridOS] CSI unavailable ({e})")
@@ -129,15 +131,14 @@ class EchoGridOS:
         self.field.inject(x, y, strength)
 
     def step(self, drive_body: bool = False, closed_loop: bool = True) -> np.ndarray:
-        # --- CSI intake (WiFi sensing) ---
         if self.csi is not None:
             self.csi.poll()
-            x, y, force = self.csi.injection_point()
             self.last_csi_energy = self.csi.last_energy
-            if force > 0.02:
-                self.field.inject(x, y, force=force * 0.85)
+            self.csi_packets = self.csi.packet_count
+            x, y, force = self.csi.injection_point()
+            if force > 0.015:
+                self.field.inject(x, y, force=force * 0.9)
 
-        # --- ultrasonic body observation intake ---
         if closed_loop and self.body is not None:
             obs = self.body.poll_observation()
             if obs is not None:
@@ -171,12 +172,12 @@ class EchoGridOS:
                 mode_bits.append("csi")
             if not mode_bits:
                 mode_bits.append("soft")
-            mode = "+".join(mode_bits)
             print(
-                f"[field] mode={mode}  "
+                f"[field] mode={'+'.join(mode_bits)}  "
                 f"entropy={self.field.entropy:.3f}  "
                 f"obs={self.last_obs:.3f}  "
                 f"csi={self.last_csi_energy:.3f}  "
+                f"pkts={self.csi_packets}  "
                 f"t={self.t:.1f}s"
             )
 

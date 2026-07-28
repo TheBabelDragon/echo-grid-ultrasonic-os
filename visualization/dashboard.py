@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-Echo Grid — Live Field Visualization (CSI-interactive)
+Echo Grid live visualization
 
-  python visualization/dashboard.py
   python visualization/dashboard.py --csi
-  python visualization/dashboard.py --csi --body --drive
 """
 
 from __future__ import annotations
@@ -53,7 +51,6 @@ class LiveDashboard:
         self.drive = drive
         self.closed_loop = closed_loop
         self.demo = demo
-        self.size = size
 
         self.fig, axes = plt.subplots(1, 2, figsize=(11, 5))
         self.ax_phi, self.ax_freq = axes
@@ -79,46 +76,42 @@ class LiveDashboard:
             bits.append("csi")
         if not bits:
             bits.append("soft")
-        self.fig.suptitle(
-            f"Echo Grid Ultrasonic OS  ·  mode={'+'.join(bits)}", fontsize=13
-        )
+        self.fig.suptitle(f"Echo Grid  ·  mode={'+'.join(bits)}", fontsize=13)
 
         self.status = self.fig.text(
             0.5, 0.02,
-            "entropy=0.000   obs=0.000   csi=0.000   t=0.0s",
+            "entropy=0  obs=0  csi=0  pkts=0  t=0",
             ha="center", fontsize=10, family="monospace",
         )
-
         self._t0 = time.time()
         self._ani = None
 
-    def _excite(self):
-        if not self.demo:
-            return
-        t = time.time() - self._t0
-        x = 0.5 + 0.30 * np.sin(t * 0.55)
-        y = 0.5 + 0.30 * np.cos(t * 0.41)
-        self.osys.touch(x, y, strength=0.35)
-
     def update(self, _frame):
-        self._excite()
+        if self.demo:
+            t = time.time() - self._t0
+            self.osys.touch(
+                0.5 + 0.30 * np.sin(t * 0.55),
+                0.5 + 0.30 * np.cos(t * 0.41),
+                strength=0.25,
+            )
+
         phi = self.osys.step(drive_body=self.drive, closed_loop=self.closed_loop)
         freq = 40000.0 + phi * 2000.0
 
         self.im_phi.set_array(phi)
         self.im_freq.set_array(freq)
-
         self.status.set_text(
             f"entropy={self.osys.field.entropy:.3f}   "
             f"obs={self.osys.last_obs:.3f}   "
             f"csi={self.osys.last_csi_energy:.3f}   "
+            f"pkts={self.osys.csi_packets}   "
             f"t={self.osys.t:.1f}s"
         )
         return [self.im_phi, self.im_freq, self.status]
 
     def run(self):
         if _BACKEND == "Agg":
-            print("⚠️  No interactive GUI backend. Install tk: sudo pacman -S tk")
+            print("No GUI backend — install tk: sudo pacman -S tk")
             self.osys.close()
             return
 
@@ -134,28 +127,25 @@ class LiveDashboard:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Echo Grid live visualization")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--body", nargs="?", const="", default=None)
-    parser.add_argument("--csi", nargs="?", const=4210, type=int, default=None,
-                        help="Enable CSI UDP input (default port 4210)")
+    parser.add_argument("--csi", nargs="?", const=4210, type=int, default=None)
     parser.add_argument("--drive", action="store_true")
     parser.add_argument("--no-loop", action="store_true")
-    parser.add_argument("--no-demo", action="store_true",
-                        help="Only CSI/body drive the field")
+    parser.add_argument("--no-demo", action="store_true")
     parser.add_argument("--size", type=int, default=16)
     args = parser.parse_args()
 
-    print(f"[dashboard] backend={_BACKEND}")
+    print(f"[dashboard] backend={_BACKEND}  csi_port={args.csi}")
 
-    dash = LiveDashboard(
+    LiveDashboard(
         size=args.size,
         body_port=args.body,
         csi_port=args.csi,
         drive=args.drive,
         closed_loop=not args.no_loop,
         demo=not args.no_demo,
-    )
-    dash.run()
+    ).run()
 
 
 if __name__ == "__main__":
