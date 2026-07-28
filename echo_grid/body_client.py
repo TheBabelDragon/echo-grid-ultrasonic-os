@@ -1,9 +1,6 @@
 """
 Field Body Client — host side of the Field Body Protocol
-
-Accepts observations from both:
-  - Echo Body (compact OBS {..} lines)
-  - optical-body-s3 (rich JSON + compact OBS lines)
+Production-hardened: accepts compact OBS and rich optical JSON.
 """
 
 from __future__ import annotations
@@ -20,7 +17,7 @@ except ImportError:
 
 
 class FieldBodyClient:
-    def __init__(self, port: Optional[str] = None, baud: int = 115200, timeout: float = 0.3):
+    def __init__(self, port: Optional[str] = None, baud: int = 115200, timeout: float = 0.25):
         if serial is None:
             raise RuntimeError("pyserial is required: pip install pyserial")
         self.port = port or self._auto_detect_port()
@@ -49,7 +46,10 @@ class FieldBodyClient:
 
     def close(self) -> None:
         if self._ser and self._ser.is_open:
-            self._ser.close()
+            try:
+                self._ser.close()
+            except Exception:
+                pass
 
     def _send(self, line: str) -> None:
         if not self._ser or not self._ser.is_open:
@@ -58,7 +58,7 @@ class FieldBodyClient:
         self._ser.flush()
 
     def excite(self, emitter_id: int) -> None:
-        self._send(f"EXCITE {emitter_id}")
+        self._send(f"EXCITE {int(emitter_id)}")
 
     def map(self) -> None:
         self._send("MAP")
@@ -70,21 +70,17 @@ class FieldBodyClient:
         self._send("PASSIVE")
 
     def _normalize_obs(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Normalize rich optical format into the compact shape the kernel expects."""
         if "regions" in data:
             return data
 
-        # optical rich format uses "field_regions"
-        regions = data.get("field_regions") or data.get("regions") or []
-        if not regions and "modality" in data:
-            # fallback single value if somehow present
-            regions = [{"region": "optical", "observed": 0.0, "confidence": 0.5}]
-
-        # pick the strongest region for simple closed-loop use
+        regions = data.get("field_regions") or []
         best = None
         best_val = -1.0
         for r in regions:
-            val = float(r.get("observed", 0.0))
+            try:
+                val = float(r.get("observed", 0.0))
+            except (TypeError, ValueError):
+                val = 0.0
             if val > best_val:
                 best_val = val
                 best = r
@@ -92,14 +88,13 @@ class FieldBodyClient:
         return {
             "body_id": data.get("body_id", "unknown"),
             "body_type": data.get("body_type", "optical"),
-            "excitation_id": data.get("excitation_id", data.get("modality", {}).get("laser_id", -1)),
+            "excitation_id": data.get("excitation_id", -1),
             "geometry_state": data.get("geometry_state", "unknown"),
             "health": data.get("health", "ok"),
             "regions": [best] if best else [{"region": "none", "observed": 0.0, "confidence": 0.0}],
         }
 
     def poll_observation(self) -> Optional[Dict[str, Any]]:
-        """Non-blocking read. Accepts both OBS {..} and raw rich JSON."""
         if not self._ser or not self._ser.is_open:
             return None
 

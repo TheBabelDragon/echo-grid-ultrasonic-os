@@ -1,53 +1,45 @@
 # Echo Grid Ultrasonic OS
 
-**A real-time programmable wavefield computer**  
-Coupled oscillator field → ultrasonic phase/amplitude/frequency mapping → physical actuation.
+Real-time programmable wavefield computer.  
+Coupled oscillator field → ultrasonic mapping → physical body (optional).
 
-This is a software-defined spatial acoustic actuator system designed for phased ultrasonic arrays and distributed emitter swarms.
+Sibling to the optical body under the shared [Field Body Protocol](docs/FIELD_BODY_PROTOCOL.md).
 
-It also serves as the **ultrasonic physical body** sibling to [optical-body-s3](https://github.com/TheBabelDragon/optical-body-s3) under a shared [Field Body Protocol](docs/FIELD_BODY_PROTOCOL.md).
-
-## Quick Start (software only)
+## Run
 
 ```bash
 pip install -r requirements.txt
+
+# software only (stable, production defaults)
 python main.py
+
+# with physical Echo Body
+python main.py --body
+python main.py --body /dev/ttyUSB0 --drive
 ```
 
-## With physical Echo Body
-
-```bash
-# Flash firmware/echo_body.ino to an ESP32 first
-python main.py --body                # auto-detect serial port
-python main.py --body /dev/ttyUSB0   # explicit port
-python main.py --body --drive        # also map the live field onto emitters
-```
-
-## Project Structure
+## What you should see
 
 ```
-echo-grid-ultrasonic-os/
-├── echo_grid/
-│   ├── core.py           # Field kernel + OS controller
-│   ├── body_client.py    # Field Body Protocol client
-│   └── __init__.py
-├── firmware/
-│   ├── echo_body.ino     # ESP32 ultrasonic body
-│   └── README.md
-├── fpga/                 # Verilog DDS cores
-├── visualization/
-├── docs/
-│   ├── ARCHITECTURE.md
-│   └── FIELD_BODY_PROTOCOL.md
-├── main.py
-└── requirements.txt
+[field] mode=soft  entropy=0.412  obs=0.000  t=3.2s
+✅ saved → echo_save.json
 ```
 
-## Core Equation
+- `mode=soft` — no body attached  
+- `mode=body` — closed-loop body connected  
+- `entropy` stays bounded (soft clamp)  
+- `obs` rises only when a real sensor reports energy  
+- saves happen once per interval, not in a spam burst
 
-$$
-\phi_{t+1} = \phi_t + \lambda \nabla^2 \phi_t - \gamma \phi_t + \omega
-$$
+## Layout
+
+```
+echo_grid/          field kernel + body client
+firmware/           ESP32 Echo Body
+fpga/               Verilog DDS cores
+visualization/      live field viewer
+docs/               architecture + protocol
+```
 
 ## License
 
