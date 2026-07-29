@@ -1,4 +1,4 @@
-"""CSI Bridge — multi-node registry, :4210 in, cmds :4211."""
+"""CSI Bridge — multi-node/multiband fusion, :4210 in, cmds :4211."""
 
 from __future__ import annotations
 
@@ -10,10 +10,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from .csi_tracks import KalmanTrack, TrackStore
+from .multiband import MultibandFuser, infer_band
 
 
 class CSIBridge:
-    def __init__(self, port: int = 4210, cmd_port: int = 4211, timeout: float = 0.02):
+    def __init__(self, port: int = 4210, cmd_port: int = 4211, timeout: float = 0.02, grid_size: int = 16):
         self.port = port
         self.cmd_port = cmd_port
         self.timeout = timeout
@@ -29,13 +30,16 @@ class CSIBridge:
         self._last_cmd_t = 0.0
         self._last_mode = ""
         self.tracks = TrackStore(max_tracks=6, ttl_s=2.4)
+        self.fuser = MultibandFuser(size=grid_size, source_ttl=1.4)
         self.last_vals: Optional[np.ndarray] = None
         self.last_residual: Optional[np.ndarray] = None
         self.motion_history: List[float] = []
         self.cmd_count = 0
-        # multi-node registry: node_id -> {packet, addr, t, motion}
         self.nodes: Dict[str, Dict[str, Any]] = {}
         self._replay_queue: List[Dict[str, Any]] = []
+        self.last_fuse_agreed = False
+        self.last_fuse_bands = 0
+        self.last_fuse_sources = 0
         self._open()
 
     def _open(self) -> None:
@@ -53,7 +57,7 @@ class CSIBridge:
                 pass
             self.sock.bind(("0.0.0.0", self.port))
             self.sock.settimeout(self.timeout)
-            print(f"[CSI] listening :{self.port}")
+            print(f"[CSI] listening :{self.port} (multiband fuse on)")
         except OSError as e:
             print(f"[CSI] bind failed: {e}")
             self.sock = None
@@ -118,6 +122,8 @@ class CSIBridge:
             motion=round(float(motion), 3),
             df_max=round(float(df_max), 1),
             nodes=len(self.nodes),
+            bands=self.last_fuse_bands,
+            agreed=bool(self.last_fuse_agreed),
         )
 
         if n_tracks >= 2 or motion > 0.55 or entropy > 0.45:
@@ -135,27 +141,54 @@ class CSIBridge:
         if mode != self._last_mode:
             print(
                 f"[CSI] closed-loop → {mode} "
-                f"(H={entropy:.2f} tracks={n_tracks} nodes={len(self.nodes)} df={df_max:.0f})"
+                f"(H={entropy:.2f} tracks={n_tracks} nodes={len(self.nodes)} "
+                f"bands={self.last_fuse_bands} agreed={self.last_fuse_agreed})"
             )
             self._last_mode = mode
 
     def _ingest(self, pkt: Dict[str, Any], addr: Optional[Tuple[str, int]] = None) -> None:
         node = str(pkt.get("node") or (addr[0] if addr else "unknown"))
+        band = infer_band(pkt)
         self.nodes[node] = {
             "packet": pkt,
             "addr": addr,
             "t": time.time(),
             "rssi": pkt.get("rssi", -90),
+            "band": band,
         }
         if addr:
             self.last_addr = addr
+
+        # Track update first so residual/motion exist on store
         self.tracks.update_from_packet(pkt)
+        residual = getattr(self.tracks, "last_residual", None)
+        vals = getattr(self.tracks, "last_vals", None)
+        raw_motion = float(self.tracks.motion_energy)
+
+        fused = self.fuser.observe(
+            node=node,
+            pkt=pkt,
+            motion=raw_motion,
+            residual=residual,
+            vals=vals,
+            addr=addr,
+        )
+        self.last_fuse_agreed = fused.agreed
+        self.last_fuse_bands = fused.n_bands
+        self.last_fuse_sources = fused.n_sources
+
+        # Overlap elimination: scale track energy trust via fused motion
+        if self.fuser.should_trust_tracks():
+            self.last_energy = float(0.45 * raw_motion + 0.55 * fused.motion)
+        else:
+            # single-source / disagreed — damp inject energy
+            self.last_energy = float(0.35 * fused.motion)
+
         self.last_packet = pkt
         self.packet_count += 1
         self.last_rx_time = time.time()
-        self.last_energy = float(self.tracks.motion_energy)
-        self.last_vals = getattr(self.tracks, "last_vals", None)
-        self.last_residual = getattr(self.tracks, "last_residual", None)
+        self.last_vals = vals
+        self.last_residual = residual
         self.motion_history.append(self.last_energy)
         if len(self.motion_history) > 200:
             self.motion_history = self.motion_history[-200:]
@@ -165,7 +198,6 @@ class CSIBridge:
             self.last_rssi = -90.0
 
     def poll(self) -> Optional[Dict[str, Any]]:
-        # offline replay first
         if self._replay_queue:
             pkt = self._replay_queue.pop(0)
             self._ingest(pkt, None)
@@ -197,7 +229,6 @@ class CSIBridge:
                 self.last_energy *= 0.88
                 if self.last_energy < 0.01:
                     self.last_energy = 0.0
-            # expire stale nodes
             now = time.time()
             self.nodes = {k: v for k, v in self.nodes.items() if now - v["t"] < 5.0}
             return None
@@ -205,8 +236,9 @@ class CSIBridge:
         if self._logged < 8:
             node = latest.get("node", "?")
             print(
-                f"[CSI] rx #{self.packet_count} node={node} "
-                f"nodes={len(self.nodes)} motion={self.last_energy:.3f}"
+                f"[CSI] rx #{self.packet_count} node={node} band={infer_band(latest)} "
+                f"nodes={len(self.nodes)} sources={self.last_fuse_sources} "
+                f"agreed={self.last_fuse_agreed} motion={self.last_energy:.3f}"
             )
             self._logged += 1
         return latest
@@ -216,10 +248,24 @@ class CSIBridge:
             return "no nodes"
         parts = []
         for nid, info in list(self.nodes.items())[:4]:
-            parts.append(f"{nid}")
+            parts.append(f"{nid}:{info.get('band', '?')}")
         return ",".join(parts)
 
     def spatial_map(self, size: int = 16) -> np.ndarray:
+        """Prefer fused belief field; fall back to residual projection."""
+        if self.fuser.last_fused is not None:
+            grid = self.fuser.field.spatial_for_display()
+            if grid.shape[0] != size:
+                # simple nearest resize
+                ys = np.linspace(0, grid.shape[0] - 1, size)
+                xs = np.linspace(0, grid.shape[1] - 1, size)
+                out = np.zeros((size, size), dtype=np.float32)
+                for j, y in enumerate(ys):
+                    for i, x in enumerate(xs):
+                        out[j, i] = grid[int(round(y)), int(round(x))]
+                return out
+            return grid
+
         grid = np.zeros((size, size), dtype=np.float32)
         res = self.last_residual
         vals = self.last_vals
@@ -260,4 +306,8 @@ class CSIBridge:
         return grid / m
 
     def active_tracks(self) -> List[KalmanTrack]:
-        return self.tracks.active()
+        tracks = self.tracks.active()
+        # When fusion disagrees, only keep high-confidence confirmed tracks
+        if not self.fuser.should_trust_tracks():
+            tracks = [t for t in tracks if t.confirmed and t.confidence > 0.45]
+        return tracks
