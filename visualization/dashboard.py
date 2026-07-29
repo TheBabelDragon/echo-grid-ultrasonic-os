@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Echo Grid live — driverless |Δf| equilibrium from CSI drive map."""
+"""Echo Grid live — multiband fusion HUD + belief spatial map."""
 
 from __future__ import annotations
 
@@ -75,7 +75,7 @@ class LiveDashboard:
         self.im_csi = self.ax_csi_sp.imshow(
             z.copy(), cmap="magma", vmin=0, vmax=1, origin="lower", extent=[0, 1, 0, 1],
         )
-        self.ax_csi_sp.set_title("2 · CSI spatial map", fontsize=11)
+        self.ax_csi_sp.set_title("2 · Fused radio belief", fontsize=11)
         self.fig.colorbar(self.im_csi, ax=self.ax_csi_sp, fraction=0.046, pad=0.04)
         self.csi_readout = self.ax_csi_sp.text(
             0.02, 0.98, "waiting…", transform=self.ax_csi_sp.transAxes,
@@ -86,9 +86,8 @@ class LiveDashboard:
         self.im_df = self.ax_df.imshow(
             z.copy(), cmap="inferno", vmin=0, vmax=400, origin="lower", extent=[0, 1, 0, 1],
         )
-        self.ax_df.set_title("3 · Actuator drive |Δf| (CSI-held)", fontsize=11)
+        self.ax_df.set_title("3 · Actuator drive |Δf|", fontsize=11)
         self.cbar_df = self.fig.colorbar(self.im_df, ax=self.ax_df, fraction=0.046, pad=0.04)
-        self.cbar_df.set_label("|Hz| planned")
         self.df_readout = self.ax_df.text(
             0.02, 0.98, "|Δf| max —", transform=self.ax_df.transAxes,
             ha="left", va="top", fontsize=9, family="monospace", color="white",
@@ -110,7 +109,7 @@ class LiveDashboard:
         if self.osys.body_connected:
             bits.append("body")
         if self.osys.csi_enabled:
-            bits.append("csi")
+            bits.append("csi+fuse")
         self.fig.suptitle(f"Echo Grid  ·  {'+'.join(bits) or 'idle'}", fontsize=13)
         self.status = self.fig.text(0.5, 0.01, "", ha="center", fontsize=9, family="monospace")
         self.fig.canvas.mpl_connect("close_event", lambda e: setattr(self, "_running", False))
@@ -166,13 +165,13 @@ class LiveDashboard:
         self.im_csi.set_data(spatial)
         self.im_csi.set_clim(0.0, max(0.25, float(spatial.max()) + 1e-9))
         e = float(self.osys.last_csi_energy)
-        bt = self.osys.body_type or ("body" if self.osys.body_connected else "-")
+        agreed = "Y" if self.osys.fuse_agreed else "n"
         self.csi_readout.set_text(
-            f"motion {e:.2f}   pkts {self.osys.csi_packets}\n"
-            f"tracks {len(tracks)}   body {bt}"
+            f"motion {e:.2f}  pkts {self.osys.csi_packets}\n"
+            f"src {self.osys.fuse_sources}  bands {self.osys.fuse_bands}  "
+            f"agree {agreed}  conf {self.osys.fuse_conf:.2f}"
         )
 
-        # CSI-held drive map (works driverless)
         df_abs = np.array(self.osys.actuator_map(phi_view), dtype=np.float32, copy=True)
         self.im_df.set_data(df_abs)
         df_max = float(df_abs.max())
@@ -186,7 +185,7 @@ class LiveDashboard:
         self.im_df.set_clim(0.0, max(150.0, self._df_clim))
         self.df_readout.set_text(
             f"|Δf| max {df_max:.0f} Hz   mean {df_mean:.0f}\n"
-            f"CSI-held drive   motion {e:.2f}"
+            f"belief→drive   agree {agreed}"
         )
 
         hist = self.osys.csi.motion_history if self.osys.csi else []
@@ -199,15 +198,17 @@ class LiveDashboard:
 
         self.status.set_text(
             f"frame={self._frame}  motion={e:.3f}  tracks={len(tracks)}  "
-            f"|Δf|_max={df_max:.0f}Hz  drive={self.osys.field._drive:.2f}  pkts={self.osys.csi_packets}"
+            f"fuse={self.osys.fuse_sources}s/{self.osys.fuse_bands}b agree={agreed}  "
+            f"|Δf|_max={df_max:.0f}Hz  pkts={self.osys.csi_packets}"
         )
 
         now = time.time()
         if now - self._last_log > 1.0:
             self._last_log = now
             print(
-                f"[live] |Δf|_max={df_max:.1f}  mean={df_mean:.1f}  "
-                f"motion={e:.3f}  drive={self.osys.field._drive:.2f}  pkts={self.osys.csi_packets}"
+                f"[live] |Δf|_max={df_max:.1f}  motion={e:.3f}  "
+                f"fuse={self.osys.fuse_sources}s/{self.osys.fuse_bands}b agree={agreed}  "
+                f"tracks={len(tracks)}"
             )
 
     def run(self):

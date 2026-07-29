@@ -1,11 +1,11 @@
-"""Echo Grid — driverless visual equilibrium via CSI-held drive map."""
+"""Echo Grid — fused radio belief → φ inject (multiband-aware)."""
 
 from __future__ import annotations
 
 import json
 import time
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import numpy as np
 
@@ -32,6 +32,29 @@ class EchoFieldOS:
                 d2 = dx * dx + dy * dy + 1e-6
                 self.vel[j, i] += np.exp(-d2 * 0.12) * force
 
+    def inject_grid(self, mass: np.ndarray, scale: float = 1.0):
+        """Distribute force proportional to a [0,1] occupancy grid."""
+        if mass.shape != self.phi.shape:
+            return
+        m = mass.astype(np.float32)
+        peak = float(m.max())
+        if peak < 0.05:
+            return
+        # sample up to 6 local maxima
+        flat = m.copy()
+        for _ in range(6):
+            j, i = np.unravel_index(int(np.argmax(flat)), flat.shape)
+            v = float(flat[j, i])
+            if v < 0.12 * peak:
+                break
+            x = (i + 0.5) / self.size
+            y = (j + 0.5) / self.size
+            self.inject(x, y, force=scale * v)
+            # suppress neighborhood for next peak
+            j0, j1 = max(0, j - 2), min(self.size, j + 3)
+            i0, i1 = max(0, i - 2), min(self.size, i + 3)
+            flat[j0:j1, i0:i1] = 0.0
+
     def step(self) -> np.ndarray:
         lap = (
             np.roll(self.phi, 1, 0) + np.roll(self.phi, -1, 0) +
@@ -40,12 +63,9 @@ class EchoFieldOS:
         self.vel += (lap - self.phi) * self.lmbda
         self.vel *= self.gamma
         self.phi += self.vel
-
         self._drive *= 0.985
-        # only settle when truly undriven
         if self._drive < 0.03:
             self.phi *= 0.992
-
         np.clip(self.phi, -self.max_abs, self.max_abs, out=self.phi)
         np.clip(self.vel, -self.max_abs, self.max_abs, out=self.vel)
         self.entropy = float(np.std(self.phi))
@@ -71,16 +91,9 @@ class UltrasonicMapper:
         motion: float = 0.0,
         hold_hz: float = 400.0,
     ) -> np.ndarray:
-        """Driverless visual equilibrium: |Δf| from φ blended with CSI spatial.
-
-        While sensing is alive, the actuator panel shows a held drive plan
-        even if φ has not fully built up yet.
-        """
         base = self.delta_f_abs(field).astype(np.float32)
         if csi_spatial is not None and csi_spatial.shape == field.shape:
-            # CSI energy as planned actuator magnitude (Hz)
-            planned = (csi_spatial.astype(np.float32) * hold_hz * max(0.15, motion))
-            # take envelope of field-mapped and sensing-planned
+            planned = csi_spatial.astype(np.float32) * hold_hz * max(0.15, motion)
             out = np.maximum(base, planned)
         else:
             out = base
@@ -89,8 +102,8 @@ class UltrasonicMapper:
     def region_energies(self, field: np.ndarray, n_emitters: int = 4) -> List[float]:
         h, w = field.shape
         regions = [
-            field[0:h//2, 0:w//2], field[0:h//2, w//2:w],
-            field[h//2:h, 0:w//2], field[h//2:h, w//2:w],
+            field[0:h // 2, 0:w // 2], field[0:h // 2, w // 2:w],
+            field[h // 2:h, 0:w // 2], field[h // 2:h, w // 2:w],
         ]
         return [float(np.mean(np.abs(r))) for r in regions[:n_emitters]]
 
@@ -131,6 +144,10 @@ class EchoGridOS:
         self.last_df_max = 0.0
         self.last_drive_map: Optional[np.ndarray] = None
         self.body_type = None
+        self.fuse_agreed = False
+        self.fuse_sources = 0
+        self.fuse_bands = 0
+        self.fuse_conf = 0.0
         self._status_t = 0.0
         self._last_save_bucket = -1
         self.body_connected = False
@@ -151,7 +168,7 @@ class EchoGridOS:
         if csi_port is not None:
             try:
                 from .csi_bridge import CSIBridge
-                self.csi = CSIBridge(port=int(csi_port) if csi_port else 4210)
+                self.csi = CSIBridge(port=int(csi_port) if csi_port else 4210, grid_size=size)
                 self.csi_enabled = self.csi.sock is not None
             except Exception as e:
                 print(f"[EchoGridOS] CSI unavailable ({e})")
@@ -178,20 +195,47 @@ class EchoGridOS:
             self.field.inject(x, y, force=0.55 * val * max(0.3, conf))
             self.last_obs = max(self.last_obs * 0.9, val)
 
+    def _ingest_csi_belief(self):
+        """Primary path: fused occupancy → φ. Tracks secondary."""
+        assert self.csi is not None
+        self.csi.poll()
+        self.last_csi_energy = self.csi.last_energy
+        self.csi_packets = self.csi.packet_count
+        self.fuse_agreed = bool(getattr(self.csi, "last_fuse_agreed", False))
+        self.fuse_sources = int(getattr(self.csi, "last_fuse_sources", 0))
+        self.fuse_bands = int(getattr(self.csi, "last_fuse_bands", 0))
+        self.fuse_conf = float(self.csi.fuser.fused_confidence()) if hasattr(self.csi, "fuser") else 0.0
+
+        # 1) Belief-field peaks (tomography readout)
+        fused = getattr(self.csi.fuser, "last_fused", None)
+        if fused is not None and float(fused.occupancy.max()) > 0.08:
+            scale = 0.55 * max(0.25, fused.confidence) * (1.25 if fused.agreed else 0.65)
+            self.field.inject_grid(fused.occupancy, scale=scale)
+
+        # 2) Confirmed tracks (byproduct, still useful)
+        for tr in self.csi.active_tracks():
+            if tr.confidence < 0.28:
+                continue
+            gain = 0.5 if tr.state == "idle" else (0.85 if tr.state == "move" else 1.1)
+            if self.fuse_agreed:
+                gain *= 1.15
+            if tr.energy > 0.04:
+                self.field.inject(
+                    tr.pos[0], tr.pos[1],
+                    force=gain * tr.energy * max(0.3, tr.confidence),
+                )
+
+        # 3) Fallback diffuse inject if energy but no structure yet
+        if fused is None and self.last_csi_energy > 0.1:
+            self.field.inject(0.5, 0.5, force=0.5 * self.last_csi_energy)
+
     def actuator_map(self, phi: Optional[np.ndarray] = None) -> np.ndarray:
-        """Living |Δf| image for display / future drivers."""
         if phi is None:
             phi = self.field.phi
-        spatial = None
-        if self.csi is not None:
-            spatial = self.csi.spatial_map(self.field.size)
+        spatial = self.csi.spatial_map(self.field.size) if self.csi else None
         dm = self.mapper.drive_map(
-            phi,
-            csi_spatial=spatial,
-            motion=self.last_csi_energy,
-            hold_hz=450.0,
+            phi, csi_spatial=spatial, motion=self.last_csi_energy, hold_hz=450.0,
         )
-        # hold last frame softly so panel doesn't flicker to zero between packets
         if self.last_drive_map is not None and self.last_drive_map.shape == dm.shape:
             if float(dm.max()) < 15.0 and self.csi_packets > 0:
                 dm = np.maximum(dm, self.last_drive_map * 0.92)
@@ -203,22 +247,7 @@ class EchoGridOS:
 
     def step(self, drive_body: bool = False, closed_loop: bool = True) -> np.ndarray:
         if self.csi is not None:
-            self.csi.poll()
-            self.last_csi_energy = self.csi.last_energy
-            self.csi_packets = self.csi.packet_count
-            tracks = self.csi.active_tracks()
-            if tracks:
-                for tr in tracks:
-                    if tr.confidence < 0.25:
-                        continue
-                    gain = 0.85 if tr.state == "idle" else (1.25 if tr.state == "move" else 1.5)
-                    if tr.energy > 0.03:
-                        self.field.inject(
-                            tr.pos[0], tr.pos[1],
-                            force=gain * tr.energy * max(0.35, tr.confidence),
-                        )
-            elif self.last_csi_energy > 0.08:
-                self.field.inject(0.5, 0.5, force=0.65 * self.last_csi_energy)
+            self._ingest_csi_belief()
 
         self._ingest_body(closed_loop)
         phi = self.field.step()
@@ -248,8 +277,9 @@ class EchoGridOS:
             ntr = len(self.csi.active_tracks()) if self.csi else 0
             print(
                 f"[field] entropy={self.field.entropy:.3f}  motion={self.last_csi_energy:.3f}  "
-                f"tracks={ntr}  |Δf|_max={self.last_df_max:.0f}Hz  "
-                f"drive={self.field._drive:.2f}  pkts={self.csi_packets}  t={self.t:.1f}s"
+                f"tracks={ntr}  fuse={self.fuse_sources}s/{self.fuse_bands}b "
+                f"agreed={self.fuse_agreed}  |Δf|_max={self.last_df_max:.0f}Hz  "
+                f"drive={self.field._drive:.2f}  t={self.t:.1f}s"
             )
         return phi
 
