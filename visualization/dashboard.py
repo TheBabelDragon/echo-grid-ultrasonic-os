@@ -61,8 +61,14 @@ def _peaks(grid: np.ndarray, max_peaks: int = 5, floor: float = 0.15):
 
 
 class LiveDashboard:
-    def __init__(self, size=16, body_port=None, csi_port=4210, drive=False, closed_loop=True):
-        self.osys = EchoGridOS(size=size, body_port=body_port, csi_port=csi_port)
+    def __init__(self, size=16, body_port=None, csi_port=4210, drive=False, closed_loop=True,
+                 metafield_log=None):
+        self.osys = EchoGridOS(
+            size=size,
+            body_port=body_port,
+            csi_port=csi_port,
+            metafield_log=metafield_log,
+        )
         self.drive = drive
         self.closed_loop = closed_loop
         self.size = size
@@ -159,6 +165,8 @@ class LiveDashboard:
             bits.append("body")
         if self.osys.csi_enabled:
             bits.append("csi+fuse")
+        if self.osys._mf_emitter is not None:
+            bits.append("metafield")
         self.fig.suptitle(f"Echo Grid  ·  {'+'.join(bits) or 'idle'}  ·  intelligent HUD", fontsize=13)
         self.status = self.fig.text(0.5, 0.01, "", ha="center", fontsize=8, family="monospace")
         self.fig.canvas.mpl_connect("close_event", lambda e: setattr(self, "_running", False))
@@ -373,9 +381,17 @@ def main():
     p.add_argument("--drive", action="store_true")
     p.add_argument("--no-loop", action="store_true")
     p.add_argument("--size", type=int, default=16)
+    p.add_argument(
+        "--metafield-log",
+        default=None,
+        help="Append FieldObservation JSONL for MetaField (e.g. /tmp/metafield/echo.jsonl)",
+    )
     a = p.parse_args()
     csi_port = None if a.no_csi else a.csi
-    LiveDashboard(a.size, a.body, csi_port, a.drive, not a.no_loop).run()
+    LiveDashboard(
+        a.size, a.body, csi_port, a.drive, not a.no_loop,
+        metafield_log=a.metafield_log,
+    ).run()
 
 
 if __name__ == "__main__":

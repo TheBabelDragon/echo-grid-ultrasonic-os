@@ -131,6 +131,9 @@ class EchoGridOS:
         body_port: Optional[str] = None,
         csi_port: Optional[int] = None,
         auto_body: bool = False,
+        metafield_log: Optional[str] = None,
+        metafield_body_id: str = "echo-grid-01",
+        metafield_every_n: int = 4,
     ):
         self.field = EchoFieldOS(size)
         self.mapper = UltrasonicMapper()
@@ -152,6 +155,19 @@ class EchoGridOS:
         self._last_save_bucket = -1
         self.body_connected = False
         self.csi_enabled = False
+        self._mf_emitter = None
+
+        if metafield_log:
+            try:
+                from .metafield_bridge import MetaFieldEmitter
+                self._mf_emitter = MetaFieldEmitter(
+                    path=metafield_log,
+                    body_id=metafield_body_id,
+                    every_n=metafield_every_n,
+                )
+                print(f"[EchoGridOS] MetaField log → {metafield_log}")
+            except Exception as e:
+                print(f"[EchoGridOS] MetaField bridge unavailable ({e})")
 
         if body_port is not None or auto_body:
             try:
@@ -269,6 +285,12 @@ class EchoGridOS:
                     self.body.excite(best)
                 except Exception:
                     pass
+
+        if self._mf_emitter is not None:
+            try:
+                self._mf_emitter.maybe_emit(self)
+            except Exception:
+                pass
 
         self.t += 0.016
         now = time.time()
