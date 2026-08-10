@@ -4,6 +4,7 @@ Live motion head for Echo Grid.
 Loads the MetaField echo_head.pt checkpoint (TinyFieldHead) and scores
 motion residual online so the dashboard can display learned surprise.
 
+Hot-reloads when the retrain loop rewrites the checkpoint.
 Optional torch dependency — only needed to load the checkpoint once.
 Forward pass is pure numpy after load.
 """
@@ -27,7 +28,6 @@ def _clip01(x: float) -> float:
 
 
 def features_from_osys(osys: Any) -> List[float]:
-    """Match MetaField echo_field_predictor feature layout."""
     motion = _clip01(float(getattr(osys, "last_csi_energy", 0.0)))
     entropy = float(getattr(osys.field, "entropy", 0.0))
     entropy_n = _clip01(entropy / 1.5)
@@ -54,10 +54,7 @@ def features_from_osys(osys: Any) -> List[float]:
 
 
 class _NumpyMLP:
-    """TinyFieldHead forward in numpy: Linear-ReLU-Linear-ReLU-Linear-Sigmoid."""
-
     def __init__(self, weights: List[Tuple[np.ndarray, np.ndarray]]):
-        # weights: list of (W [out,in], b [out]) for each Linear
         self.layers = weights
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
@@ -65,9 +62,9 @@ class _NumpyMLP:
         for i, (W, b) in enumerate(self.layers):
             h = h @ W.T + b
             if i < len(self.layers) - 1:
-                h = np.maximum(h, 0.0)  # ReLU
+                h = np.maximum(h, 0.0)
             else:
-                h = 1.0 / (1.0 + np.exp(-np.clip(h, -40, 40)))  # Sigmoid
+                h = 1.0 / (1.0 + np.exp(-np.clip(h, -40, 40)))
         return h.astype(np.float32)
 
 
@@ -84,7 +81,6 @@ def _load_torch_mlp(path: Path) -> Tuple[_NumpyMLP, int, int]:
     window = int(ckpt.get("window", 8))
     in_dim = int(ckpt.get("in_dim", window * len(FEATURE_NAMES)))
 
-    # net.0, net.2, net.4 are Linear layers in TinyFieldHead
     layers = []
     for idx in (0, 2, 4):
         W = sd[f"net.{idx}.weight"].detach().cpu().numpy()
@@ -94,8 +90,6 @@ def _load_torch_mlp(path: Path) -> Tuple[_NumpyMLP, int, int]:
 
 
 class LiveFieldHead:
-    """Rolling-window residual scorer for EchoGridOS."""
-
     def __init__(self, model_path: str | Path, threshold: float = 0.30):
         self.path = Path(model_path)
         self.threshold = float(threshold)
@@ -109,12 +103,41 @@ class LiveFieldHead:
         self.ready = False
         self.n_scored = 0
         self.n_surprise = 0
+        try:
+            self._mtime = self.path.stat().st_mtime
+        except OSError:
+            self._mtime = 0.0
+        self._reload_every = 40
         print(
             f"[field_head] loaded {self.path}  window={self.window}  "
             f"in_dim={self.in_dim}  threshold={self.threshold:.2f}"
         )
 
+    def maybe_reload(self) -> bool:
+        """Hot-reload weights if echo_head.pt was rewritten by retrain loop."""
+        try:
+            mtime = self.path.stat().st_mtime
+        except OSError:
+            return False
+        if mtime <= self._mtime:
+            return False
+        try:
+            mlp, window, in_dim = _load_torch_mlp(self.path)
+        except Exception as e:
+            print(f"[field_head] reload failed ({e})")
+            return False
+        self.mlp = mlp
+        self.window = window
+        self.in_dim = in_dim
+        self._mtime = mtime
+        self.history = deque(maxlen=self.window)
+        self.ready = False
+        print(f"[field_head] hot-reload {self.path}  window={window} in_dim={in_dim}")
+        return True
+
     def update(self, osys: Any) -> Dict[str, float]:
+        if self.n_scored > 0 and self.n_scored % self._reload_every == 0:
+            self.maybe_reload()
         feats = features_from_osys(osys)
         if len(self.history) < self.window:
             self.history.append(feats)
@@ -131,7 +154,6 @@ class LiveFieldHead:
 
         x = np.array([v for row in self.history for v in row], dtype=np.float64)
         if x.shape[0] != self.in_dim:
-            # window/feature mismatch — reset
             self.history.clear()
             self.history.append(feats)
             self.ready = False
