@@ -33,14 +33,12 @@ class EchoFieldOS:
                 self.vel[j, i] += np.exp(-d2 * 0.12) * force
 
     def inject_grid(self, mass: np.ndarray, scale: float = 1.0):
-        """Distribute force proportional to a [0,1] occupancy grid."""
         if mass.shape != self.phi.shape:
             return
         m = mass.astype(np.float32)
         peak = float(m.max())
         if peak < 0.05:
             return
-        # sample up to 6 local maxima
         flat = m.copy()
         for _ in range(6):
             j, i = np.unravel_index(int(np.argmax(flat)), flat.shape)
@@ -50,7 +48,6 @@ class EchoFieldOS:
             x = (i + 0.5) / self.size
             y = (j + 0.5) / self.size
             self.inject(x, y, force=scale * v)
-            # suppress neighborhood for next peak
             j0, j1 = max(0, j - 2), min(self.size, j + 3)
             i0, i1 = max(0, i - 2), min(self.size, i + 3)
             flat[j0:j1, i0:i1] = 0.0
@@ -136,6 +133,7 @@ class EchoGridOS:
         metafield_every_n: int = 4,
         field_head: Optional[str] = None,
         field_head_threshold: float = 0.30,
+        automata_events: Optional[str] = None,
     ):
         self.field = EchoFieldOS(size)
         self.mapper = UltrasonicMapper()
@@ -164,6 +162,9 @@ class EchoGridOS:
         self.last_abs_residual = 0.0
         self.head_surprise = False
         self.head_ready = False
+        self._automata = None
+        self.last_gates: list = []
+        self.automata_events = 0
 
         if field_head:
             try:
@@ -172,6 +173,14 @@ class EchoGridOS:
             except Exception as e:
                 print(f"[EchoGridOS] field head unavailable ({e})")
                 self._field_head = None
+
+        if automata_events:
+            try:
+                from .automata_events import AutomataEventTail
+                self._automata = AutomataEventTail(automata_events)
+            except Exception as e:
+                print(f"[EchoGridOS] automata events unavailable ({e})")
+                self._automata = None
 
         if metafield_log:
             try:
@@ -228,7 +237,6 @@ class EchoGridOS:
             self.last_obs = max(self.last_obs * 0.9, val)
 
     def _ingest_csi_belief(self):
-        """Primary path: fused occupancy → φ. Tracks secondary."""
         assert self.csi is not None
         self.csi.poll()
         self.last_csi_energy = self.csi.last_energy
@@ -238,13 +246,11 @@ class EchoGridOS:
         self.fuse_bands = int(getattr(self.csi, "last_fuse_bands", 0))
         self.fuse_conf = float(self.csi.fuser.fused_confidence()) if hasattr(self.csi, "fuser") else 0.0
 
-        # 1) Belief-field peaks (tomography readout)
         fused = getattr(self.csi.fuser, "last_fused", None)
         if fused is not None and float(fused.occupancy.max()) > 0.08:
             scale = 0.55 * max(0.25, fused.confidence) * (1.25 if fused.agreed else 0.65)
             self.field.inject_grid(fused.occupancy, scale=scale)
 
-        # 2) Confirmed tracks (byproduct, still useful)
         for tr in self.csi.active_tracks():
             if tr.confidence < 0.28:
                 continue
@@ -257,7 +263,6 @@ class EchoGridOS:
                     force=gain * tr.energy * max(0.3, tr.confidence),
                 )
 
-        # 3) Fallback diffuse inject if energy but no structure yet
         if fused is None and self.last_csi_energy > 0.1:
             self.field.inject(0.5, 0.5, force=0.5 * self.last_csi_energy)
 
@@ -316,10 +321,29 @@ class EchoGridOS:
                 self.last_abs_residual = float(stats["abs_residual"])
                 self.head_surprise = bool(stats["surprise"])
                 self.head_ready = bool(stats["ready"])
-                # mild φ emphasis when learned residual is high
                 if self.head_surprise and self.head_ready:
                     boost = min(0.55, 0.25 + 0.5 * self.last_abs_residual)
                     self.field.inject(0.5, 0.5, force=boost * max(0.2, self.last_csi_energy))
+            except Exception:
+                pass
+
+        if self._automata is not None:
+            try:
+                for ev in self._automata.poll():
+                    gates = list(ev.get("gates") or [])
+                    self.last_gates = gates
+                    self.automata_events = self._automata.n_events
+                    force = 0.35
+                    if "SURPRISE_CONFIRMED" in gates:
+                        force = 0.7
+                    elif "TRACKED_SURPRISE" in gates:
+                        force = 0.55
+                    elif "HIGH_MOTION_SURPRISE" in gates:
+                        force = 0.5
+                    elif "QUIET_ANOMALY" in gates:
+                        force = 0.4
+                    self.field.inject(0.5, 0.5, force=force)
+                    print(f"[automata] gates={','.join(gates)}  φ-boost={force:.2f}")
             except Exception:
                 pass
 
@@ -334,6 +358,8 @@ class EchoGridOS:
                     f"  |r|={self.last_abs_residual:.3f}"
                     f"{' SURPRISE' if self.head_surprise else ''}"
                 )
+            if self.last_gates:
+                head_bit += f"  gates={','.join(self.last_gates[:2])}"
             print(
                 f"[field] entropy={self.field.entropy:.3f}  motion={self.last_csi_energy:.3f}  "
                 f"tracks={ntr}  fuse={self.fuse_sources}s/{self.fuse_bands}b "
