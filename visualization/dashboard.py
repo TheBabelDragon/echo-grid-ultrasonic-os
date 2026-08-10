@@ -35,6 +35,7 @@ from matplotlib.lines import Line2D
 from echo_grid.core import EchoGridOS
 
 TRACK_COLORS = ["#ff4d6d", "#4cc9f0", "#f4a261", "#a0e8af", "#c77dff", "#ffe066"]
+DEFAULT_METAFIELD_LOG = "/tmp/metafield/echo.jsonl"
 
 
 def _peaks(grid: np.ndarray, max_peaks: int = 5, floor: float = 0.15):
@@ -246,7 +247,6 @@ class LiveDashboard:
             if i < len(tracks):
                 tr = tracks[i]
                 x, y = tr.pos
-                # confidence * fuse_scale can exceed 1.0 when agreed + high fuse_conf
                 a = float(np.clip((0.3 + tr.confidence * 0.7) * fuse_scale, 0.0, 1.0))
                 ring.center = (x, y)
                 ring.set_radius(0.03 + 0.12 * float(np.clip(tr.energy, 0.0, 1.0)))
@@ -316,12 +316,10 @@ class LiveDashboard:
         if self._conf_hist:
             cs = np.asarray(self._conf_hist, dtype=float)
             self.conf_line.set_data(np.arange(len(cs)), cs)
-        # agree shading via vertical markers
         for art in list(self.ax_hist.lines):
             if getattr(art, "_echo_mark", False):
                 art.remove()
         for fr, lab in self._mode_marks:
-            # map frame to x roughly if hist length known
             x = max(0, len(hist[-120:]) - (self._frame - fr))
             if 0 <= x <= 120:
                 ln = self.ax_hist.axvline(x, color="#ffe066" if lab == "AGR" else "#888",
@@ -330,7 +328,6 @@ class LiveDashboard:
 
         for rect, h in zip(self.bars, self._sub_bars()):
             rect.set_height(float(h))
-            # tint bars by agreement
             rect.set_color("#4cc9f0" if not agreed else "#c77dff")
 
         self.status.set_text(
@@ -383,8 +380,10 @@ def main():
     p.add_argument("--size", type=int, default=16)
     p.add_argument(
         "--metafield-log",
+        nargs="?",
+        const=DEFAULT_METAFIELD_LOG,
         default=None,
-        help="Append FieldObservation JSONL for MetaField (e.g. /tmp/metafield/echo.jsonl)",
+        help=f"Write FieldObservation JSONL (default path: {DEFAULT_METAFIELD_LOG})",
     )
     a = p.parse_args()
     csi_port = None if a.no_csi else a.csi
