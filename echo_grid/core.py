@@ -134,6 +134,8 @@ class EchoGridOS:
         metafield_log: Optional[str] = None,
         metafield_body_id: str = "echo-grid-01",
         metafield_every_n: int = 4,
+        field_head: Optional[str] = None,
+        field_head_threshold: float = 0.30,
     ):
         self.field = EchoFieldOS(size)
         self.mapper = UltrasonicMapper()
@@ -156,6 +158,20 @@ class EchoGridOS:
         self.body_connected = False
         self.csi_enabled = False
         self._mf_emitter = None
+        self._field_head = None
+        self.last_pred_motion = 0.0
+        self.last_residual = 0.0
+        self.last_abs_residual = 0.0
+        self.head_surprise = False
+        self.head_ready = False
+
+        if field_head:
+            try:
+                from .field_head import LiveFieldHead
+                self._field_head = LiveFieldHead(field_head, threshold=field_head_threshold)
+            except Exception as e:
+                print(f"[EchoGridOS] field head unavailable ({e})")
+                self._field_head = None
 
         if metafield_log:
             try:
@@ -292,16 +308,37 @@ class EchoGridOS:
             except Exception:
                 pass
 
+        if self._field_head is not None:
+            try:
+                stats = self._field_head.update(self)
+                self.last_pred_motion = float(stats["pred_motion"])
+                self.last_residual = float(stats["residual"])
+                self.last_abs_residual = float(stats["abs_residual"])
+                self.head_surprise = bool(stats["surprise"])
+                self.head_ready = bool(stats["ready"])
+                # mild φ emphasis when learned residual is high
+                if self.head_surprise and self.head_ready:
+                    boost = min(0.55, 0.25 + 0.5 * self.last_abs_residual)
+                    self.field.inject(0.5, 0.5, force=boost * max(0.2, self.last_csi_energy))
+            except Exception:
+                pass
+
         self.t += 0.016
         now = time.time()
         if now - self._status_t >= 1.2:
             self._status_t = now
             ntr = len(self.csi.active_tracks()) if self.csi else 0
+            head_bit = ""
+            if self._field_head is not None and self.head_ready:
+                head_bit = (
+                    f"  |r|={self.last_abs_residual:.3f}"
+                    f"{' SURPRISE' if self.head_surprise else ''}"
+                )
             print(
                 f"[field] entropy={self.field.entropy:.3f}  motion={self.last_csi_energy:.3f}  "
                 f"tracks={ntr}  fuse={self.fuse_sources}s/{self.fuse_bands}b "
                 f"agreed={self.fuse_agreed}  |Δf|_max={self.last_df_max:.0f}Hz  "
-                f"drive={self.field._drive:.2f}  t={self.t:.1f}s"
+                f"drive={self.field._drive:.2f}{head_bit}  t={self.t:.1f}s"
             )
         return phi
 
