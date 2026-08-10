@@ -226,7 +226,7 @@ class LiveDashboard:
                 x, y, v = peaks[i]
                 mark.center = (x, y)
                 mark.set_radius(0.03 + 0.05 * v)
-                mark.set_alpha(0.35 + 0.55 * v)
+                mark.set_alpha(float(np.clip(0.35 + 0.55 * v, 0.0, 1.0)))
                 mark.set_edgecolor("#ffffff" if self.osys.fuse_agreed else "#ffaa00")
             else:
                 mark.set_alpha(0)
@@ -238,11 +238,12 @@ class LiveDashboard:
             if i < len(tracks):
                 tr = tracks[i]
                 x, y = tr.pos
-                a = min(1.0, 0.3 + tr.confidence * 0.7) * fuse_scale
+                # confidence * fuse_scale can exceed 1.0 when agreed + high fuse_conf
+                a = float(np.clip((0.3 + tr.confidence * 0.7) * fuse_scale, 0.0, 1.0))
                 ring.center = (x, y)
-                ring.set_radius(0.03 + 0.12 * tr.energy)
+                ring.set_radius(0.03 + 0.12 * float(np.clip(tr.energy, 0.0, 1.0)))
                 ring.set_alpha(a)
-                ring.set_linewidth(1.5 + 2.0 * tr.confidence)
+                ring.set_linewidth(1.5 + 2.0 * float(np.clip(tr.confidence, 0.0, 1.0)))
                 dot.set_data([x], [y])
                 dot.set_alpha(a)
                 lab.set_position((x + 0.03, y + 0.03))
