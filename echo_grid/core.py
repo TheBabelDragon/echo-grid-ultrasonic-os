@@ -334,7 +334,16 @@ class EchoGridOS:
                     self.last_gates = gates
                     self.automata_events = self._automata.n_events
                     force = 0.35
-                    if "SURPRISE_CONFIRMED" in gates:
+                    level = int(ev.get("level") or 1)
+                    if "FULL_LOCK" in gates:
+                        force = 1.0
+                    elif "ACTIVE_FIELD" in gates:
+                        force = 0.85
+                    elif "CONFIRMED_TRACK" in gates:
+                        force = 0.8
+                    elif "STEALTH_BREAK" in gates:
+                        force = 0.75
+                    elif "SURPRISE_CONFIRMED" in gates:
                         force = 0.7
                     elif "TRACKED_SURPRISE" in gates:
                         force = 0.55
@@ -343,7 +352,10 @@ class EchoGridOS:
                     elif "QUIET_ANOMALY" in gates:
                         force = 0.4
                     self.field.inject(0.5, 0.5, force=force)
-                    print(f"[automata] gates={','.join(gates)}  φ-boost={force:.2f}")
+                    print(
+                        f"[automata] L{level} gates={','.join(gates[:4])}  "
+                        f"φ-boost={force:.2f}"
+                    )
             except Exception:
                 pass
 
