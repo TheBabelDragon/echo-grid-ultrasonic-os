@@ -36,6 +36,7 @@ from echo_grid.core import EchoGridOS
 
 TRACK_COLORS = ["#ff4d6d", "#4cc9f0", "#f4a261", "#a0e8af", "#c77dff", "#ffe066"]
 DEFAULT_METAFIELD_LOG = "/tmp/metafield/echo.jsonl"
+DEFAULT_FIELD_HEAD = "/tmp/metafield/echo_head.pt"
 
 
 def _peaks(grid: np.ndarray, max_peaks: int = 5, floor: float = 0.15):
@@ -63,12 +64,14 @@ def _peaks(grid: np.ndarray, max_peaks: int = 5, floor: float = 0.15):
 
 class LiveDashboard:
     def __init__(self, size=16, body_port=None, csi_port=4210, drive=False, closed_loop=True,
-                 metafield_log=None):
+                 metafield_log=None, field_head=None, field_head_threshold=0.30):
         self.osys = EchoGridOS(
             size=size,
             body_port=body_port,
             csi_port=csi_port,
             metafield_log=metafield_log,
+            field_head=field_head,
+            field_head_threshold=field_head_threshold,
         )
         self.drive = drive
         self.closed_loop = closed_loop
@@ -81,6 +84,8 @@ class LiveDashboard:
         self._agree_hist: deque = deque(maxlen=120)
         self._mode_marks: deque = deque(maxlen=8)  # (frame, label)
         self._last_agree = None
+        self._resid_hist: deque = deque(maxlen=120)
+        self._pred_hist: deque = deque(maxlen=120)
 
         self.fig = plt.figure(figsize=(13, 9.5))
         gs = self.fig.add_gridspec(2, 2, hspace=0.34, wspace=0.28,
@@ -147,13 +152,15 @@ class LiveDashboard:
             bbox=dict(boxstyle="round,pad=0.25", facecolor="#222", alpha=0.8),
         )
 
-        self.ax_hist.set_title("4 · Motion + fuse confidence", fontsize=11)
+        self.ax_hist.set_title("4 · Motion + pred + residual", fontsize=11)
         self.ax_hist.set_xlim(0, 120)
         self.ax_hist.set_ylim(0, 1.05)
         self.hist_line, = self.ax_hist.plot([], [], color="#00d4aa", lw=2.0, label="motion")
         self.conf_line, = self.ax_hist.plot([], [], color="#c77dff", lw=1.6, alpha=0.9, label="fuse conf")
+        self.pred_line, = self.ax_hist.plot([], [], color="#ffe066", lw=1.4, alpha=0.9, label="pred motion")
+        self.resid_line, = self.ax_hist.plot([], [], color="#ff4d6d", lw=1.5, alpha=0.95, label="|residual|")
         self.agree_fill = self.ax_hist.fill_between([0], [0], [0], color="#2a9d8a", alpha=0.15)
-        self.ax_hist.legend(loc="upper left", fontsize=7, framealpha=0.6)
+        self.ax_hist.legend(loc="upper left", fontsize=6, framealpha=0.6)
         self.ax_bars = self.ax_hist.inset_axes([0.55, 0.55, 0.42, 0.4])
         self.ax_bars.set_xlim(-0.5, 16.5)
         self.ax_bars.set_ylim(0, 1)
@@ -168,6 +175,8 @@ class LiveDashboard:
             bits.append("csi+fuse")
         if self.osys._mf_emitter is not None:
             bits.append("metafield")
+        if self.osys._field_head is not None:
+            bits.append("head")
         self.fig.suptitle(f"Echo Grid  ·  {'+'.join(bits) or 'idle'}  ·  intelligent HUD", fontsize=13)
         self.status = self.fig.text(0.5, 0.01, "", ha="center", fontsize=8, family="monospace")
         self.fig.canvas.mpl_connect("close_event", lambda e: setattr(self, "_running", False))
@@ -236,7 +245,10 @@ class LiveDashboard:
                 mark.center = (x, y)
                 mark.set_radius(0.03 + 0.05 * v)
                 mark.set_alpha(float(np.clip(0.35 + 0.55 * v, 0.0, 1.0)))
-                mark.set_edgecolor("#ffffff" if self.osys.fuse_agreed else "#ffaa00")
+                if self.osys.head_surprise:
+                    mark.set_edgecolor("#ff4d6d")
+                else:
+                    mark.set_edgecolor("#ffffff" if self.osys.fuse_agreed else "#ffaa00")
             else:
                 mark.set_alpha(0)
 
@@ -277,6 +289,8 @@ class LiveDashboard:
         agreed = self.osys.fuse_agreed
         self._conf_hist.append(self.osys.fuse_conf)
         self._agree_hist.append(1.0 if agreed else 0.0)
+        self._resid_hist.append(float(self.osys.last_abs_residual) if self.osys.head_ready else 0.0)
+        self._pred_hist.append(float(self.osys.last_pred_motion) if self.osys.head_ready else 0.0)
         if self._last_agree is not None and agreed != self._last_agree:
             self._mode_marks.append((self._frame, "AGR" if agreed else "sgl"))
         self._last_agree = agreed
@@ -316,6 +330,12 @@ class LiveDashboard:
         if self._conf_hist:
             cs = np.asarray(self._conf_hist, dtype=float)
             self.conf_line.set_data(np.arange(len(cs)), cs)
+        if self._pred_hist:
+            ps = np.asarray(self._pred_hist, dtype=float)
+            self.pred_line.set_data(np.arange(len(ps)), ps)
+        if self._resid_hist:
+            rs = np.asarray(self._resid_hist, dtype=float)
+            self.resid_line.set_data(np.arange(len(rs)), rs)
         for art in list(self.ax_hist.lines):
             if getattr(art, "_echo_mark", False):
                 art.remove()
@@ -330,19 +350,32 @@ class LiveDashboard:
             rect.set_height(float(h))
             rect.set_color("#4cc9f0" if not agreed else "#c77dff")
 
+        head_bit = ""
+        if self.osys._field_head is not None:
+            if self.osys.head_ready:
+                head_bit = (
+                    f"  pred={self.osys.last_pred_motion:.2f}"
+                    f"  |r|={self.osys.last_abs_residual:.3f}"
+                    f"{'  SURPRISE' if self.osys.head_surprise else ''}"
+                )
+            else:
+                head_bit = "  head=warming"
         self.status.set_text(
             f"frame={self._frame}  motion={e:.3f}  tracks={len(tracks)}  peaks={len(peaks)}  "
             f"fuse={self.osys.fuse_sources}s/{self.osys.fuse_bands}b agree={'Y' if agreed else 'n'}  "
-            f"|Δf|_max={df_max:.0f}Hz  click-φ to inject"
+            f"|Δf|_max={df_max:.0f}Hz{head_bit}  click-φ to inject"
         )
 
         now = time.time()
         if now - self._last_log > 1.0:
             self._last_log = now
+            extra = ""
+            if self.osys.head_ready:
+                extra = f"  |r|={self.osys.last_abs_residual:.3f}{' SURPRISE' if self.osys.head_surprise else ''}"
             print(
                 f"[live] |Δf|_max={df_max:.1f}  motion={e:.3f}  peaks={len(peaks)}  "
                 f"fuse={self.osys.fuse_sources}s/{self.osys.fuse_bands}b agree={'Y' if agreed else 'n'}  "
-                f"tracks={len(tracks)}"
+                f"tracks={len(tracks)}{extra}"
             )
 
     def run(self):
@@ -385,11 +418,26 @@ def main():
         default=None,
         help=f"Write FieldObservation JSONL (default path: {DEFAULT_METAFIELD_LOG})",
     )
+    p.add_argument(
+        "--field-head",
+        nargs="?",
+        const=DEFAULT_FIELD_HEAD,
+        default=None,
+        help=f"Load MetaField motion head for residual HUD (default: {DEFAULT_FIELD_HEAD})",
+    )
+    p.add_argument(
+        "--head-threshold",
+        type=float,
+        default=0.30,
+        help="Abs residual threshold for SURPRISE (default 0.30)",
+    )
     a = p.parse_args()
     csi_port = None if a.no_csi else a.csi
     LiveDashboard(
         a.size, a.body, csi_port, a.drive, not a.no_loop,
         metafield_log=a.metafield_log,
+        field_head=a.field_head,
+        field_head_threshold=a.head_threshold,
     ).run()
 
 
