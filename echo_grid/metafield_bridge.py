@@ -10,7 +10,6 @@ No dependency on the metafield package — pure dict/JSON.
 from __future__ import annotations
 
 import json
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -36,7 +35,6 @@ def build_observation(
     """
     motion = _clip01(float(getattr(osys, "last_csi_energy", 0.0)))
     entropy = float(getattr(osys.field, "entropy", 0.0))
-    # normalize entropy roughly into [0,1] for observed (raw also in extras)
     entropy_n = _clip01(entropy / 1.5)
     df_max = float(getattr(osys, "last_df_max", 0.0))
     df_n = _clip01(df_max / 2000.0)
@@ -123,14 +121,13 @@ def build_observation(
         except Exception:
             continue
 
-    # health heuristic
     health = "ok"
     if packets == 0 and getattr(osys, "csi_enabled", False):
         health = "stale"
     elif motion > 0.95 and not fuse_agreed and fuse_sources < 2:
         health = "partial"
 
-    obs: Dict[str, Any] = {
+    return {
         "schema_version": 1,
         "body_id": body_id,
         "body_type": "ultrasonic",
@@ -155,13 +152,12 @@ def build_observation(
         },
         "health": health,
     }
-    return obs
 
 
 class MetaFieldEmitter:
     """Append FieldObservation JSON lines for MetaField consumption."""
 
-    def __init(
+    def __init__(
         self,
         path: Path | str,
         body_id: str = "echo-grid-01",
@@ -173,16 +169,16 @@ class MetaFieldEmitter:
         self._frame = 0
         self._count = 0
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Create empty file immediately so MetaField --follow unblocks
+        if not self.path.exists():
+            self.path.touch()
+        print(f"[metafield] emitter ready → {self.path.resolve()}")
 
     def maybe_emit(self, osys: Any) -> Optional[Dict[str, Any]]:
         self._frame += 1
         if self._frame % self.every_n != 0:
             return None
-        obs = build_observation(osys, body_id=self.body_id, excitation_id=self._count)
-        self._count += 1
-        with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(obs, default=str) + "\n")
-        return obs
+        return self.emit_now(osys)
 
     def emit_now(self, osys: Any) -> Dict[str, Any]:
         obs = build_observation(osys, body_id=self.body_id, excitation_id=self._count)
