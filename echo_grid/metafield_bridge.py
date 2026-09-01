@@ -26,13 +26,6 @@ def build_observation(
     body_id: str = "echo-grid-01",
     excitation_id: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """
-    Snapshot EchoGridOS state into a FieldObservation-shaped dict.
-
-    Regions (stable names):
-      motion, entropy, df_max, drive,
-      track_<id> for each active track
-    """
     motion = _clip01(float(getattr(osys, "last_csi_energy", 0.0)))
     entropy = float(getattr(osys.field, "entropy", 0.0))
     entropy_n = _clip01(entropy / 1.5)
@@ -127,6 +120,14 @@ def build_observation(
     elif motion > 0.95 and not fuse_agreed and fuse_sources < 2:
         health = "partial"
 
+    isolated = health == "ok" and drive < 0.08
+    if drive >= 0.08:
+        phase = "charge"
+    elif health != "ok":
+        phase = "relax"
+    else:
+        phase = "hold"
+
     return {
         "schema_version": 1,
         "body_id": body_id,
@@ -136,6 +137,9 @@ def build_observation(
         "geometry_state": "calibrated" if packets > 20 else "uncalibrated",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "modality": {
+            "isolated": isolated,
+            "phase": phase,
+            "body_drive": False,
             "echo": {
                 "t": float(getattr(osys, "t", 0.0)),
                 "csi_packets": packets,
@@ -169,7 +173,6 @@ class MetaFieldEmitter:
         self._frame = 0
         self._count = 0
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        # Create empty file immediately so MetaField --follow unblocks
         if not self.path.exists():
             self.path.touch()
         print(f"[metafield] emitter ready → {self.path.resolve()}")
