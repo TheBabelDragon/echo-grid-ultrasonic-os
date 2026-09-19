@@ -46,6 +46,22 @@ python optical_serial_consumer.py \
 
 Regions emitted: `motion`, `entropy`, `df_max`, `drive`, `fuse`, plus `track_<id>` for each active track.
 
+## CAVITATION.SWEEP (calibration)
+
+Measurement-first cavitation calibration. Characterises abstract drive command
+vs acoustic/optical response. Simulation is the default; no hardware is
+energised unless an explicit sensor backend is supplied.
+
+```bash
+# hardware-free demo
+python tools/cavitation_sweep_demo.py
+
+# tests
+python -m pytest tests/test_cavitation.py -v
+```
+
+See [docs/CAVITATION_SWEEP.md](docs/CAVITATION_SWEEP.md).
+
 ## License
 
 MIT
